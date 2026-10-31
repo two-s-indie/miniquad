@@ -207,6 +207,50 @@ fn roundup_ub_buffer(current_buffer: u64) -> u64 {
     ((current_buffer) + ((UNIFORM_BUFFER_ALIGN) - 1)) & !((UNIFORM_BUFFER_ALIGN) - 1)
 }
 
+fn uniform_buffer_end(offset: u64, size: usize) -> Option<u64> {
+    // The start must remain inside the buffer, including for empty writes,
+    // because it is also passed to Metal as a buffer binding offset.
+    if offset >= MAX_UNIFORM_BUFFER_SIZE {
+        return None;
+    }
+    offset
+        .checked_add(size as u64)
+        .filter(|&end| end <= MAX_UNIFORM_BUFFER_SIZE)
+}
+
+#[cfg(test)]
+mod uniform_buffer_tests {
+    use super::{uniform_buffer_end, MAX_UNIFORM_BUFFER_SIZE};
+
+    #[test]
+    fn accepts_empty_and_exact_fit_writes() {
+        assert_eq!(uniform_buffer_end(0, 0), Some(0));
+        assert_eq!(uniform_buffer_end(256, 512), Some(768));
+        assert_eq!(
+            uniform_buffer_end(0, MAX_UNIFORM_BUFFER_SIZE as usize),
+            Some(MAX_UNIFORM_BUFFER_SIZE)
+        );
+        assert_eq!(
+            uniform_buffer_end(MAX_UNIFORM_BUFFER_SIZE - 256, 256),
+            Some(MAX_UNIFORM_BUFFER_SIZE)
+        );
+    }
+
+    #[test]
+    fn rejects_writes_past_the_remaining_capacity() {
+        assert_eq!(uniform_buffer_end(MAX_UNIFORM_BUFFER_SIZE - 256, 512), None);
+        assert_eq!(uniform_buffer_end(MAX_UNIFORM_BUFFER_SIZE - 256, 257), None);
+        assert_eq!(uniform_buffer_end(MAX_UNIFORM_BUFFER_SIZE, 0), None);
+        assert_eq!(uniform_buffer_end(MAX_UNIFORM_BUFFER_SIZE + 1, 0), None);
+    }
+
+    #[test]
+    fn rejects_overflowing_write_lengths() {
+        assert_eq!(uniform_buffer_end(1, usize::MAX), None);
+        assert_eq!(uniform_buffer_end(u64::MAX, 1), None);
+    }
+}
+
 // Per-buffer rotation pool for the within-frame update-draw-update-draw
 // pattern. Metal's `update` doesn't synchronously claim ownership, so
 // each within-frame update needs its own backing `MTLBuffer` to keep
@@ -1253,12 +1297,10 @@ impl RenderingBackend for MetalContext {
 
         let render_encoder = self.render_encoder.unwrap();
 
+        let end = uniform_buffer_end(self.current_ub_offset, size)
+            .expect("Metal uniform buffer capacity exceeded");
+
         self.current_frame_index = (self.current_frame_index + 1) % NUM_INFLIGHT_FRAMES;
-
-        assert!(size < MAX_UNIFORM_BUFFER_SIZE as usize);
-
-        assert!(self.current_ub_offset < MAX_UNIFORM_BUFFER_SIZE);
-
         let buffer = self.uniform_buffers[self.current_frame_index];
         unsafe {
             let dest: *mut std::ffi::c_void = msg_send![buffer, contents];
@@ -1280,7 +1322,7 @@ impl RenderingBackend for MetalContext {
                        offset:self.current_ub_offset
                        atIndex:0];
         }
-        self.current_ub_offset = roundup_ub_buffer(self.current_ub_offset + size as u64);
+        self.current_ub_offset = roundup_ub_buffer(end);
     }
 
     fn begin_default_pass(&mut self, action: PassAction) {
