@@ -740,21 +740,17 @@ unsafe extern "system" fn win32_wndproc(
         }
         WM_DROPFILES => {
             let hdrop = wparam as HDROP;
-            let mut path = core::mem::MaybeUninit::<[u16; MAX_PATH]>::uninit();
+            // DragQueryFileW writes only the filename prefix of the buffer.
+            let mut path = [0u16; MAX_PATH];
             let num_drops = DragQueryFileW(hdrop, u32::MAX, std::ptr::null_mut(), 0);
 
             let mut d = crate::native_display().lock().unwrap();
             d.dropped_files = Default::default();
             for i in 0..num_drops {
-                let path_ptr = path.as_mut_ptr() as *mut u16;
+                let path_ptr = path.as_mut_ptr();
                 let path_len = DragQueryFileW(hdrop, i, path_ptr, MAX_PATH as u32) as usize;
                 if path_len > 0 {
-                    // SAFETY: `DragQueryFileW` initializes `path_ptr` up to `path_len`
-                    // elements before use, and we only access the initialized portion.
-                    let path = unsafe {
-                        let path = path.assume_init();
-                        PathBuf::from(OsString::from_wide(&path[0..path_len]))
-                    };
+                    let path = PathBuf::from(OsString::from_wide(&path[..path_len]));
                     d.dropped_files.bytes.push(std::fs::read(&path).unwrap());
                     d.dropped_files.paths.push(path);
                 }
