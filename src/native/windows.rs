@@ -10,7 +10,7 @@ use crate::{
 use winapi::{
     shared::{
         hidusage::{HID_USAGE_GENERIC_MOUSE, HID_USAGE_PAGE_GENERIC},
-        minwindef::{DWORD, HIWORD, LOWORD, LPARAM, LRESULT, MAX_PATH, TRUE, UINT, WPARAM},
+        minwindef::{DWORD, HIWORD, LOWORD, LPARAM, LRESULT, TRUE, UINT, WPARAM},
         ntdef::NULL,
         windef::{HBRUSH, HCURSOR, HDC, HICON, HWND, POINT, RECT},
         windowsx::{GET_X_LPARAM, GET_Y_LPARAM},
@@ -374,6 +374,137 @@ unsafe fn key_mods() -> KeyMods {
     }
 
     mods
+}
+
+unsafe fn dropped_file_path(hdrop: HDROP, index: UINT) -> Option<PathBuf> {
+    // The queried length excludes the terminating NUL, even for long paths.
+    let path_len = DragQueryFileW(hdrop, index, std::ptr::null_mut(), 0);
+    if path_len == 0 {
+        return None;
+    }
+
+    let capacity = path_len.checked_add(1)?;
+    let mut path_buffer = vec![0u16; capacity as usize];
+    let copied = DragQueryFileW(hdrop, index, path_buffer.as_mut_ptr(), capacity);
+    if copied != path_len {
+        return None;
+    }
+
+    Some(PathBuf::from(OsString::from_wide(
+        &path_buffer[..copied as usize],
+    )))
+}
+
+#[cfg(test)]
+mod dropped_file_tests {
+    use super::dropped_file_path;
+    use std::{os::windows::ffi::OsStrExt, path::PathBuf};
+    use winapi::{
+        shared::{minwindef::BOOL, windef::POINT},
+        um::{
+            shellapi::{DragFinish, HDROP},
+            winbase::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE},
+        },
+    };
+
+    // DROPFILES is not exposed by winapi 0.3. The header is followed by a
+    // double-NUL-terminated list of UTF-16 paths.
+    // https://learn.microsoft.com/windows/win32/api/shlobj_core/ns-shlobj_core-dropfiles
+    #[repr(C)]
+    struct DropFilesHeader {
+        files_offset: u32,
+        point: POINT,
+        non_client: BOOL,
+        wide: BOOL,
+    }
+
+    struct DropHandle(HDROP);
+
+    impl DropHandle {
+        fn new(paths: &[PathBuf]) -> Self {
+            let mut names = Vec::new();
+            for path in paths {
+                names.extend(path.as_os_str().encode_wide());
+                names.push(0);
+            }
+            names.push(0);
+            let header_size = std::mem::size_of::<DropFilesHeader>();
+
+            unsafe {
+                let handle = GlobalAlloc(GMEM_MOVEABLE, header_size + names.len() * 2);
+                assert!(!handle.is_null());
+                let drop = Self(handle as HDROP);
+                let pointer = GlobalLock(handle) as *mut u8;
+                assert!(!pointer.is_null());
+                pointer.cast::<DropFilesHeader>().write(DropFilesHeader {
+                    files_offset: header_size as u32,
+                    point: POINT { x: 0, y: 0 },
+                    non_client: 0,
+                    wide: 1,
+                });
+                std::ptr::copy_nonoverlapping(
+                    names.as_ptr(),
+                    pointer.add(header_size).cast::<u16>(),
+                    names.len(),
+                );
+                GlobalUnlock(handle);
+                drop
+            }
+        }
+    }
+
+    impl Drop for DropHandle {
+        fn drop(&mut self) {
+            unsafe { DragFinish(self.0) }
+        }
+    }
+
+    #[test]
+    fn paths_at_and_beyond_max_path_are_not_truncated() {
+        let prefix = format!("C:\\{}", "directory\\".repeat(20));
+        let paths: Vec<PathBuf> = [259, 260, 261, 1024]
+            .iter()
+            .map(|&len| {
+                let directories = "subdir\\".repeat((len - prefix.len() - 4) / 7);
+                let tail_len = len - prefix.len() - directories.len() - 4;
+                PathBuf::from(format!(
+                    "{}{}{}.txt",
+                    prefix,
+                    directories,
+                    "a".repeat(tail_len)
+                ))
+            })
+            .collect();
+        let drop = DropHandle::new(&paths);
+
+        for (index, path) in paths.into_iter().enumerate() {
+            assert_eq!(
+                unsafe { dropped_file_path(drop.0, index as u32) },
+                Some(path)
+            );
+        }
+        assert_eq!(unsafe { dropped_file_path(drop.0, 4) }, None);
+    }
+
+    #[test]
+    fn mixed_short_and_long_unicode_paths_are_preserved() {
+        let paths = [
+            PathBuf::from("C:\\short.txt"),
+            PathBuf::from(format!(
+                "C:\\{}report-\u{1f980}.txt",
+                "\u{8cc7}\u{6599}\\".repeat(100)
+            )),
+            PathBuf::from("C:\\last.txt"),
+        ];
+        let drop = DropHandle::new(&paths);
+
+        for (index, path) in paths.iter().enumerate() {
+            assert_eq!(
+                unsafe { dropped_file_path(drop.0, index as u32) }.as_ref(),
+                Some(path)
+            );
+        }
+    }
 }
 
 unsafe extern "system" fn win32_wndproc(
@@ -760,19 +891,16 @@ unsafe extern "system" fn win32_wndproc(
         }
         WM_DROPFILES => {
             let hdrop = wparam as HDROP;
-            // DragQueryFileW writes only the filename prefix of the buffer.
-            let mut path = [0u16; MAX_PATH];
             let num_drops = DragQueryFileW(hdrop, u32::MAX, std::ptr::null_mut(), 0);
 
             let mut d = crate::native_display().lock().unwrap();
             d.dropped_files = Default::default();
             for i in 0..num_drops {
-                let path_ptr = path.as_mut_ptr();
-                let path_len = DragQueryFileW(hdrop, i, path_ptr, MAX_PATH as u32) as usize;
-                if path_len > 0 {
-                    let path = PathBuf::from(OsString::from_wide(&path[..path_len]));
-                    d.dropped_files.bytes.push(std::fs::read(&path).unwrap());
-                    d.dropped_files.paths.push(path);
+                if let Some(path) = dropped_file_path(hdrop, i) {
+                    if let Ok(bytes) = std::fs::read(&path) {
+                        d.dropped_files.bytes.push(bytes);
+                        d.dropped_files.paths.push(path);
+                    }
                 }
             }
         }
