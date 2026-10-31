@@ -356,8 +356,7 @@ pub fn define_glk_or_mtk_view_dlg(superclass: &Class) -> *const Class {
         // Measure the view, not the device screen — iOS-on-Mac
         // windowed mode has view < UIScreen.
         let view_bounds: NSRect = unsafe { msg_send![payload.view, bounds] };
-        let content_scale_factor: f64 =
-            unsafe { msg_send![payload.view, contentScaleFactor] };
+        let content_scale_factor: f64 = unsafe { msg_send![payload.view, contentScaleFactor] };
         let screen_width = (view_bounds.size.width * content_scale_factor) as i32;
         let screen_height = (view_bounds.size.height * content_scale_factor) as i32;
         let dpi_scale = content_scale_factor as f32;
@@ -405,8 +404,7 @@ pub fn define_glk_or_mtk_view_dlg(superclass: &Class) -> *const Class {
         let height = size.height as i32;
         let changed = {
             let mut display = native_display().lock().unwrap();
-            let changed =
-                display.screen_width != width || display.screen_height != height;
+            let changed = display.screen_width != width || display.screen_height != height;
             if changed {
                 display.screen_width = width;
                 display.screen_height = height;
@@ -711,8 +709,7 @@ pub fn define_app_delegate() -> *const Class {
     extern "C" fn scene_will_connect(_: &Object, _: Sel, notification: ObjcId) {
         unsafe {
             let scene: ObjcId = msg_send![notification, object];
-            let is_window_scene: BOOL =
-                msg_send![scene, isKindOfClass: class!(UIWindowScene)];
+            let is_window_scene: BOOL = msg_send![scene, isKindOfClass: class!(UIWindowScene)];
             if is_window_scene == NO {
                 return;
             }

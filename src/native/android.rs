@@ -372,7 +372,11 @@ unsafe fn query_display_density() -> f32 {
     }
 
     let density = get_float_field(env, metrics, density_field);
-    if density > 0.0 { density } else { 1.0 }
+    if density > 0.0 {
+        density
+    } else {
+        1.0
+    }
 }
 
 pub struct AndroidClipboard {}

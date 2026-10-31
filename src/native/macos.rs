@@ -15,10 +15,7 @@ use {
     std::{
         collections::HashMap,
         os::raw::c_void,
-        sync::{
-            Condvar, Mutex,
-            mpsc::Receiver,
-        },
+        sync::{mpsc::Receiver, Condvar, Mutex},
         time::{Duration, Instant},
     },
 };
@@ -1152,7 +1149,11 @@ impl FramePacer {
             return;
         }
 
-        let (mut frame_ready, _) = self.frame_signal.cond.wait_timeout(frame_ready, timeout).unwrap();
+        let (mut frame_ready, _) = self
+            .frame_signal
+            .cond
+            .wait_timeout(frame_ready, timeout)
+            .unwrap();
 
         if *frame_ready {
             *frame_ready = false;
@@ -1468,7 +1469,6 @@ where
     };
     let mut done = false;
     while !(done || crate::native_display().lock().unwrap().quit_ordered) {
-
         // Wait at the top for just in time rendering
         if let Some(frame_pacer) = frame_pacer.as_ref() {
             frame_pacer.wait_next_frame(Duration::from_millis(50));
@@ -1509,6 +1509,5 @@ where
         if !conf.platform.blocking_event_loop || display.update_requested {
             perform_redraw(&mut display, conf.platform.apple_gfx_api, false);
         }
-
     }
 }
