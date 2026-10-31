@@ -22,6 +22,8 @@ pub struct X11DnD {
 impl super::X11Display {
     pub(super) unsafe fn init_drag_n_drop(&mut self) {
         // Add the window property XdndAware to inform X that we accept drag-n-drop
+        // Xlib expects native C long elements for format-32 properties.
+        let version: [libc::c_long; 1] = [5];
         (self.libx11.XChangeProperty)(
             self.display,
             self.window,
@@ -29,7 +31,7 @@ impl super::X11Display {
             4 as _,
             32,
             PropModeReplace,
-            [5].as_ptr() as _, // XDnD version number
+            version.as_ptr() as _,
             1,
         );
     }
