@@ -595,17 +595,41 @@ function dpi_scale() {
     }
 }
 
-function texture_size(internalFormat, width, height) {
-    if (internalFormat == gl.ALPHA) {
-        return width * height;
+function texture_data(pixels, format, type, width, height) {
+    let components;
+    switch (format) {
+        case 0x1902: // DEPTH_COMPONENT
+        case 0x1903: // RED
+        case 0x1906: // ALPHA
+        case 0x1909: components = 1; break; // LUMINANCE
+        case 0x8227: // RG
+        case 0x190A: components = 2; break; // LUMINANCE_ALPHA
+        case 0x1907: components = 3; break; // RGB
+        case 0x1908: components = 4; break; // RGBA
+        default: throw new Error('Unsupported texture transfer format: ' + format);
     }
-    else if (internalFormat == gl.RGB) {
-        return width * height * 3;
-    } else if (internalFormat == gl.RGBA) {
-        return width * height * 4;
-    } else { // TextureFormat::RGB565 | TextureFormat::RGBA4 | TextureFormat::RGBA5551
-        return width * height * 3;
+    let array;
+    switch (type) {
+        case 0x1401: array = Uint8Array; break; // UNSIGNED_BYTE
+        case 0x1403: // UNSIGNED_SHORT
+        case 0x140B: array = Uint16Array; break; // HALF_FLOAT
+        case 0x1405: array = Uint32Array; break; // UNSIGNED_INT
+        case 0x1406: array = Float32Array; break; // FLOAT
+        case 0x8363: // UNSIGNED_SHORT_5_6_5
+        case 0x8033: // UNSIGNED_SHORT_4_4_4_4
+        case 0x8034: // UNSIGNED_SHORT_5_5_5_1
+            array = Uint16Array;
+            components = 1;
+            break;
+        default: throw new Error('Unsupported texture transfer type: ' + type);
     }
+    const length = width * height * components;
+    if (pixels % array.BYTES_PER_ELEMENT == 0) {
+        return getArray(pixels, array, length);
+    }
+    // Rust byte slices need not be aligned for a multibyte typed-array view.
+    const bytes = getArray(pixels, Uint8Array, length * array.BYTES_PER_ELEMENT);
+    return new array(bytes.slice().buffer);
 }
 
 function mouse_relative_position(clientX, clientY) {
@@ -685,15 +709,19 @@ var importObject = {
         },
         glTexImage2D: function (target, level, internalFormat, width, height, border, format, type, pixels) {
             gl.texImage2D(target, level, internalFormat, width, height, border, format, type,
-                pixels ? getArray(pixels, Uint8Array, texture_size(internalFormat, width, height)) : null);
+                pixels ? texture_data(pixels, format, type, width, height) : null);
         },
         glTexSubImage2D: function (target, level, xoffset, yoffset, width, height, format, type, pixels) {
             gl.texSubImage2D(target, level, xoffset, yoffset, width, height, format, type,
-                pixels ? getArray(pixels, Uint8Array, texture_size(format, width, height)) : null);
+                pixels ? texture_data(pixels, format, type, width, height) : null);
         },
         glReadPixels: function (x, y, width, height, format, type, pixels) {
-            var pixelData = getArray(pixels, Uint8Array, texture_size(format, width, height));
+            var pixelData = texture_data(pixels, format, type, width, height);
             gl.readPixels(x, y, width, height, format, type, pixelData);
+            if (pixelData.buffer !== wasm_memory.buffer) {
+                getArray(pixels, Uint8Array, pixelData.byteLength).set(
+                    new Uint8Array(pixelData.buffer, pixelData.byteOffset, pixelData.byteLength));
+            }
         },
         glTexParameteri: function (target, pname, param) {
             gl.texParameteri(target, pname, param);

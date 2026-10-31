@@ -321,6 +321,8 @@ impl Error for ShaderError {}
 pub enum TextureFormat {
     RGB8,
     RGBA8,
+    /// Four IEEE 754 half-float components, stored as eight bytes per pixel.
+    /// On the web this format requires WebGL 2.
     RGBA16F,
     Depth,
     Depth32,

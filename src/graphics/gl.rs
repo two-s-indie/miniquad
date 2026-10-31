@@ -104,7 +104,7 @@ impl From<TextureFormat> for (GLenum, GLenum, GLenum) {
         match format {
             TextureFormat::RGB8 => (GL_RGB, GL_RGB, GL_UNSIGNED_BYTE),
             TextureFormat::RGBA8 => (GL_RGBA, GL_RGBA, GL_UNSIGNED_BYTE),
-            TextureFormat::RGBA16F => (GL_RGBA16F, GL_RGBA, GL_FLOAT),
+            TextureFormat::RGBA16F => (GL_RGBA16F, GL_RGBA, GL_HALF_FLOAT),
             TextureFormat::Depth => (GL_DEPTH_COMPONENT, GL_DEPTH_COMPONENT, GL_UNSIGNED_SHORT),
             TextureFormat::Depth32 => (GL_DEPTH_COMPONENT, GL_DEPTH_COMPONENT, GL_FLOAT),
             #[cfg(target_arch = "wasm32")]
