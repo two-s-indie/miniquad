@@ -7,6 +7,59 @@
 //! so use this with caution.
 
 use super::libx11::*;
+use std::convert::TryFrom;
+
+fn property_byte_len(format: libc::c_int, item_count: libc::c_ulong) -> Option<usize> {
+    // Xlib stores format-32 values as native longs, even on 64-bit systems.
+    let element_size = match format {
+        8 => std::mem::size_of::<libc::c_char>(),
+        16 => std::mem::size_of::<libc::c_short>(),
+        32 => std::mem::size_of::<libc::c_long>(),
+        _ => return None,
+    };
+    usize::try_from(item_count)
+        .ok()?
+        .checked_mul(element_size)
+        .filter(|&len| len <= isize::MAX as usize)
+}
+
+#[cfg(test)]
+mod property_buffer_tests {
+    use super::property_byte_len;
+
+    #[test]
+    fn format_16_stops_at_the_reported_item_count() {
+        // Trailing values make a doubled byte count fail without an invalid read.
+        let values = [0x1234u16, 0xabcd, 0xdead, 0xbeef];
+        let len = property_byte_len(16, 2).unwrap();
+        let bytes = unsafe { std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), len) };
+        let expected: Vec<u8> = values[..2].iter().flat_map(|v| v.to_ne_bytes()).collect();
+        assert_eq!(bytes, expected);
+    }
+
+    #[test]
+    fn formats_use_xlib_element_sizes() {
+        assert_eq!(property_byte_len(8, 3), Some(3));
+        assert_eq!(property_byte_len(16, 3), Some(6));
+        assert_eq!(
+            property_byte_len(32, 3),
+            Some(3 * std::mem::size_of::<libc::c_long>())
+        );
+        for format in [8, 16, 32] {
+            assert_eq!(property_byte_len(format, 0), Some(0));
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_formats_and_oversized_lengths() {
+        assert_eq!(property_byte_len(0, 1), None);
+        assert_eq!(property_byte_len(24, 1), None);
+        assert_eq!(property_byte_len(16, libc::c_ulong::MAX), None);
+        assert_eq!(property_byte_len(32, libc::c_ulong::MAX), None);
+        let too_many_shorts = (isize::MAX as libc::c_ulong / 2) + 1;
+        assert_eq!(property_byte_len(16, too_many_shorts), None);
+    }
+}
 
 unsafe fn get_clipboard(
     libx11: &mut LibX11,
@@ -65,14 +118,14 @@ pub(crate) unsafe fn get_property_bytes(
     property: Atom,
 ) -> Vec<u8> {
     let mut bytes = Vec::new();
-    let mut buf = std::ptr::null_mut::<libc::c_char>();
-    let mut size: libc::c_ulong = 0;
-    let mut actual_type = 0 as Atom;
-    let mut actual_format: libc::c_int = 0;
-    let mut _size_after: libc::c_ulong = 0;
     let mut incr_mode = false;
     loop {
-        (libx11.XGetWindowProperty)(
+        let mut buf = std::ptr::null_mut::<libc::c_char>();
+        let mut size: libc::c_ulong = 0;
+        let mut actual_type = 0 as Atom;
+        let mut actual_format: libc::c_int = 0;
+        let mut _size_after: libc::c_ulong = 0;
+        let status = (libx11.XGetWindowProperty)(
             display,
             window,
             property,
@@ -87,6 +140,11 @@ pub(crate) unsafe fn get_property_bytes(
             &mut buf as *mut *mut libc::c_char as _,
         );
 
+        if status != 0 {
+            (libx11.XFree)(buf as *mut libc::c_void);
+            return Vec::new();
+        }
+
         if actual_type == libx11.extensions.incr {
             // we are in INCR mode
             incr_mode = true;
@@ -95,33 +153,29 @@ pub(crate) unsafe fn get_property_bytes(
             (libx11.XFree)(buf as *mut libc::c_void);
             return bytes;
         } else {
-            let n_bits = match actual_format {
-                8 => std::mem::size_of::<libc::c_char>(),
-                16 => std::mem::size_of::<libc::c_int>(),
-                32 => std::mem::size_of::<libc::c_long>(),
-                _ => unreachable!(),
+            let byte_len = match property_byte_len(actual_format, size) {
+                Some(len) if !buf.is_null() => len,
+                _ => {
+                    (libx11.XFree)(buf as *mut libc::c_void);
+                    return Vec::new();
+                }
             };
-            bytes.extend(std::slice::from_raw_parts(
-                buf as *const _,
-                n_bits * size as usize,
-            ));
-
-            // if not in INCR mode, then we've got all the data
-            if !incr_mode {
-                (libx11.XFree)(buf as *mut libc::c_void);
-                return bytes;
-            }
+            bytes.extend_from_slice(std::slice::from_raw_parts(buf as *const _, byte_len));
         }
 
-        if incr_mode {
-            (libx11.XDeleteProperty)(display, window, property);
-            // wait until we get a new batch
-            let mut event = XEvent { type_0: 0 };
-            loop {
-                (libx11.XNextEvent)(display, &mut event);
-                if event.type_0 == PropertyNotify && event.xproperty.state == PropertyNewValue {
-                    break;
-                }
+        // Release each property allocation, including intermediate INCR chunks.
+        (libx11.XFree)(buf as *mut libc::c_void);
+        if !incr_mode {
+            return bytes;
+        }
+
+        (libx11.XDeleteProperty)(display, window, property);
+        // wait until we get a new batch
+        let mut event = XEvent { type_0: 0 };
+        loop {
+            (libx11.XNextEvent)(display, &mut event);
+            if event.type_0 == PropertyNotify && event.xproperty.state == PropertyNewValue {
+                break;
             }
         }
     }
