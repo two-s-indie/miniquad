@@ -1,4 +1,4 @@
-use std::ffi::CString;
+use std::{convert::TryFrom, ffi::CString};
 
 use crate::{window, ResourceManager};
 
@@ -1544,19 +1544,25 @@ impl RenderingBackend for GlContext {
         let pip = &self.pipelines[self.cache.cur_pipeline.unwrap().0];
         let shader = &self.shaders[pip.shader.0];
 
+        // Validate the complete byte range before any upload. Array elements
+        // and uniforms optimized out by the driver still occupy layout space.
+        let required_size = shader.uniforms.iter().try_fold(0usize, |offset, uniform| {
+            let count = usize::try_from(uniform.array_count).ok()?;
+            offset.checked_add(uniform.uniform_type.size().checked_mul(count)?)
+        });
+        assert!(
+            required_size.map_or(false, |required_size| required_size <= size),
+            "Uniforms struct does not match shader uniforms layout"
+        );
+
         let mut offset = 0;
 
         for uniform in shader.uniforms.iter() {
             use UniformType::*;
 
-            assert!(
-                offset as i32 <= size as i32 - uniform.uniform_type.size() as i32 / 4,
-                "Uniforms struct does not match shader uniforms layout"
-            );
-
             unsafe {
-                let data = (uniform_ptr as *const f32).add(offset);
-                let data_int = (uniform_ptr as *const i32).add(offset);
+                let data = uniform_ptr.add(offset) as *const f32;
+                let data_int = uniform_ptr.add(offset) as *const i32;
 
                 if let Some(gl_loc) = uniform.gl_loc {
                     match uniform.uniform_type {
@@ -1590,7 +1596,7 @@ impl RenderingBackend for GlContext {
                     }
                 }
             }
-            offset += uniform.uniform_type.size() / 4 * uniform.array_count as usize;
+            offset += uniform.uniform_type.size() * uniform.array_count as usize;
         }
     }
 
