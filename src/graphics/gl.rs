@@ -72,6 +72,17 @@ struct Texture {
 }
 
 impl TextureFormat {
+    fn buffer_size(self, width: u32, height: u32) -> usize {
+        assert!(
+            width <= i32::MAX as u32 && height <= i32::MAX as u32,
+            "Texture dimensions exceed OpenGL's signed range"
+        );
+        (width as usize)
+            .checked_mul(height as usize)
+            .and_then(|pixels| pixels.checked_mul(self.size(1, 1) as usize))
+            .expect("Texture buffer size overflow")
+    }
+
     fn sized_internal_format(&self) -> GLenum {
         match self {
             TextureFormat::RGB8 => GL_RGB8,
@@ -177,11 +188,18 @@ impl Texture {
         source: TextureSource,
         params: TextureParams,
     ) -> Texture {
-        if let TextureSource::Bytes(bytes_data) = source {
-            assert_eq!(
-                params.format.size(params.width, params.height) as usize,
-                bytes_data.len()
-            );
+        let size = params.format.buffer_size(params.width, params.height);
+        match source {
+            TextureSource::Bytes(bytes) => assert_eq!(size, bytes.len()),
+            TextureSource::Array(array) => {
+                for mipmaps in array {
+                    for (level, bytes) in mipmaps.iter().enumerate() {
+                        let (width, height) = Self::mipmap_dimensions(params, level);
+                        assert_eq!(params.format.buffer_size(width, height), bytes.len());
+                    }
+                }
+            }
+            TextureSource::Empty => {}
         }
         if access != TextureAccess::RenderTarget {
             assert!(
@@ -275,6 +293,7 @@ impl Texture {
                             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, array.len() as _);
                         }
                         for (mipmap_level, bytes) in mipmaps.iter().enumerate() {
+                            let (width, height) = Self::mipmap_dimensions(params, mipmap_level);
                             let target = match params.kind {
                                 TextureKind::Texture2D => GL_TEXTURE_2D,
                                 TextureKind::CubeMap => {
@@ -285,8 +304,8 @@ impl Texture {
                                 target,
                                 mipmap_level as _,
                                 internal_format as i32,
-                                params.width as i32,
-                                params.height as i32,
+                                width as i32,
+                                height as i32,
                                 0,
                                 format,
                                 pixel_type,
@@ -323,6 +342,10 @@ impl Texture {
     }
 
     pub fn resize(&mut self, ctx: &mut GlContext, width: u32, height: u32, source: Option<&[u8]>) {
+        let size = self.size(width, height);
+        if let Some(source) = source {
+            assert!(source.len() >= size, "Texture resize source is too small");
+        }
         let raw = self
             .raw
             .texture()
@@ -336,6 +359,7 @@ impl Texture {
         self.params.height = height;
 
         unsafe {
+            glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
             glTexImage2D(
                 GL_TEXTURE_2D,
                 0,
@@ -364,9 +388,10 @@ impl Texture {
         height: i32,
         source: &[u8],
     ) {
+        assert!(x_offset >= 0 && y_offset >= 0 && width >= 0 && height >= 0);
         assert_eq!(self.size(width as _, height as _), source.len());
-        assert!(x_offset + width <= self.params.width as _);
-        assert!(y_offset + height <= self.params.height as _);
+        assert!(x_offset as u32 + width as u32 <= self.params.width);
+        assert!(y_offset as u32 + height as u32 <= self.params.height);
         let raw = self.raw.texture().expect(
             "update_texture_part not yet implemented for RenderBuffer(multisampled) textures",
         );
@@ -409,6 +434,10 @@ impl Texture {
 
     /// Read texture data into CPU memory
     pub fn read_pixels(&self, bytes: &mut [u8]) {
+        assert!(
+            bytes.len() >= self.size(self.params.width, self.params.height),
+            "Texture readback destination is too small"
+        );
         let raw = self
             .raw
             .texture()
@@ -418,6 +447,9 @@ impl Texture {
 
         let mut fbo = 0;
         unsafe {
+            let mut pack_alignment = 0;
+            glGetIntegerv(GL_PACK_ALIGNMENT, &mut pack_alignment);
+            glPixelStorei(GL_PACK_ALIGNMENT, 1);
             let mut binded_fbo: i32 = 0;
             glGetIntegerv(gl::GL_DRAW_FRAMEBUFFER_BINDING, &mut binded_fbo);
             glGenFramebuffers(1, &mut fbo);
@@ -442,12 +474,21 @@ impl Texture {
 
             glBindFramebuffer(gl::GL_FRAMEBUFFER, binded_fbo as _);
             glDeleteFramebuffers(1, &fbo);
+            glPixelStorei(GL_PACK_ALIGNMENT, pack_alignment);
         }
     }
 
     #[inline]
     fn size(&self, width: u32, height: u32) -> usize {
-        self.params.format.size(width, height) as usize
+        self.params.format.buffer_size(width, height)
+    }
+
+    fn mipmap_dimensions(params: TextureParams, level: usize) -> (u32, u32) {
+        let level = u32::try_from(level).expect("Mipmap level overflow");
+        (
+            params.width.checked_shr(level).unwrap_or(0).max(1),
+            params.height.checked_shr(level).unwrap_or(0).max(1),
+        )
     }
 
     fn gl_filter(filter: FilterMode, mipmap_filter: MipmapFilterMode) -> GLenum {
