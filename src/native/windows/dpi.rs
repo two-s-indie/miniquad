@@ -150,7 +150,7 @@ impl DpiApi {
         }
     }
 
-    unsafe fn outer_size(
+    pub(super) unsafe fn outer_size(
         &self,
         size: (i32, i32),
         style: DWORD,
@@ -180,8 +180,8 @@ impl DpiApi {
         ))
     }
 
-    /// Only used while the window is hidden and GWLP_USERDATA is still empty.
-    /// No native-display lock or application handler exists across SetWindowPos.
+    /// Call without a display/handler borrow or native-display lock: SetWindowPos
+    /// can synchronously re-enter the window procedure.
     pub(super) unsafe fn resize_client(
         &self,
         hwnd: HWND,
@@ -190,12 +190,35 @@ impl DpiApi {
         ex_style: DWORD,
         dpi: u32,
     ) -> bool {
+        self.resize_client_at(hwnd, size, style, ex_style, dpi, None)
+    }
+
+    pub(super) unsafe fn resize_client_at(
+        &self,
+        hwnd: HWND,
+        size: (i32, i32),
+        style: DWORD,
+        ex_style: DWORD,
+        dpi: u32,
+        position: Option<(i32, i32)>,
+    ) -> bool {
         let (width, height) = match self.outer_size(size, style, ex_style, dpi) {
             Some(size) => size,
             None => return false,
         };
-        let flags = SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE;
-        if SetWindowPos(hwnd, std::ptr::null_mut(), 0, 0, width, height, flags) == 0 {
+        let flags = SWP_NOZORDER | SWP_NOACTIVATE;
+        let (x, y) = position.unwrap_or((0, 0));
+        let move_flag = if position.is_some() { 0 } else { SWP_NOMOVE };
+        if SetWindowPos(
+            hwnd,
+            std::ptr::null_mut(),
+            x,
+            y,
+            width,
+            height,
+            flags | move_flag,
+        ) == 0
+        {
             return false;
         }
 
@@ -212,13 +235,46 @@ impl DpiApi {
                     - i64::from(actual.1);
                 if let (Ok(width), Ok(height)) = (i32::try_from(width), i32::try_from(height)) {
                     if width > 0 && height > 0 {
-                        let _ =
-                            SetWindowPos(hwnd, std::ptr::null_mut(), 0, 0, width, height, flags);
+                        let _ = SetWindowPos(
+                            hwnd,
+                            std::ptr::null_mut(),
+                            0,
+                            0,
+                            width,
+                            height,
+                            flags | SWP_NOMOVE,
+                        );
                     }
                 }
             }
         }
         true
+    }
+}
+
+/// A rational logical size: retain the original pixels and their rendering DPI
+/// instead of deriving the next request from a previously rounded DPI resize.
+#[derive(Clone, Copy)]
+pub(super) struct ClientSize {
+    pixels: (i32, i32),
+    dpi: u32,
+}
+
+impl ClientSize {
+    pub(super) fn new(pixels: (i32, i32), dpi: u32) -> Self {
+        Self { pixels, dpi }
+    }
+
+    pub(super) fn at_dpi(self, dpi: u32) -> Option<(i32, i32)> {
+        if self.dpi == 0 || dpi == 0 || self.pixels.0 <= 0 || self.pixels.1 <= 0 {
+            return None;
+        }
+        let scale = |pixels: i32| {
+            let value =
+                (pixels as u64 * u64::from(dpi) + u64::from(self.dpi / 2)) / u64::from(self.dpi);
+            i32::try_from(value.max(1)).ok()
+        };
+        Some((scale(self.pixels.0)?, scale(self.pixels.1)?))
     }
 }
 
@@ -237,6 +293,28 @@ mod tests {
     use super::*;
     use std::cell::{Cell, RefCell};
     use winapi::{shared::winerror::ERROR_ACCESS_DENIED, um::errhandlingapi::SetLastError};
+
+    #[test]
+    fn transition_size_intent_does_not_accumulate_rounding() {
+        let logical = ClientSize::new((801, 601), BASE_DPI);
+        for _ in 0..100 {
+            for dpi in [96, 120, 144, 168, 192, 168, 144, 120, 96] {
+                assert_eq!(
+                    logical.at_dpi(dpi),
+                    Some((
+                        startup_pixels(801, dpi).unwrap(),
+                        startup_pixels(601, dpi).unwrap(),
+                    ))
+                );
+            }
+        }
+        let runtime = ClientSize::new((1173, 853), 168);
+        assert_eq!(runtime.at_dpi(96), Some((670, 487)));
+        assert_eq!(runtime.at_dpi(168), Some((1173, 853)));
+        assert_eq!(ClientSize::new((i32::MAX, 1), 96).at_dpi(192), None);
+        assert_eq!(ClientSize::new((0, 1), 96).at_dpi(120), None);
+        assert_eq!(ClientSize::new((1, 1), 0).at_dpi(120), None);
+    }
 
     #[test]
     fn normal_and_fullscreen_creation_stay_hidden_until_wgl_is_ready() {

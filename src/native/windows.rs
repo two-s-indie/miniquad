@@ -95,6 +95,8 @@ const IACE_CHILDREN: DWORD = 0x0001;
 
 mod clipboard;
 mod dpi;
+mod events;
+mod geometry;
 mod keycodes;
 mod libopengl32;
 mod wgl;
@@ -107,6 +109,17 @@ pub(crate) struct WindowsDisplay {
     cursor_grabbed: bool,
     iconified: bool,
     window_scale: f32,
+    high_dpi: bool,
+    window_dpi: u32,
+    dpi_api: dpi::DpiApi,
+    normal_size: dpi::ClientSize,
+    normal_client_size: (i32, i32),
+    restore_size_pending: bool,
+    windowed_placement: Option<WINDOWPLACEMENT>,
+    geometry_depth: usize,
+    dpi_changed: bool,
+    pending_dpi: Option<(u32, RECT)>,
+    events: events::PendingEvents,
     mouse_scale: f32,
     show_cursor: bool,
     user_cursor: bool,
@@ -124,26 +137,26 @@ pub(crate) struct WindowsDisplay {
 }
 
 impl WindowsDisplay {
-    fn set_cursor_grab(&mut self, grab: bool) {
-        self.cursor_grabbed = grab;
+    unsafe fn set_cursor_grab(this: *mut Self, grab: bool) {
+        (*this).cursor_grabbed = grab;
         unsafe {
             if grab {
-                update_clip_rect(self.wnd);
+                update_clip_rect((*this).wnd);
             } else {
                 ClipCursor(NULL as _);
             }
         }
     }
-    fn show_mouse(&mut self, shown: bool) {
-        if self.show_cursor != shown {
-            self.show_cursor = shown;
+    unsafe fn show_mouse(this: *mut Self, shown: bool) {
+        if (*this).show_cursor != shown {
+            (*this).show_cursor = shown;
             unsafe { ShowCursor(shown.into()) };
         }
     }
     /// Set IME candidate window position in client coordinates
-    fn set_ime_position(&mut self, x: i32, y: i32) {
+    unsafe fn set_ime_position(this: *mut Self, x: i32, y: i32) {
         unsafe {
-            let himc = ImmGetContext(self.wnd);
+            let himc = ImmGetContext((*this).wnd);
             if himc.is_null() {
                 return;
             }
@@ -165,27 +178,27 @@ impl WindowsDisplay {
             };
             ImmSetCandidateWindow(himc, &cand_form);
 
-            ImmReleaseContext(self.wnd, himc);
+            ImmReleaseContext((*this).wnd, himc);
         }
     }
 
     /// Enable or disable IME for the window.
     /// When disabled, the IME will not process keyboard input, useful for game controls.
-    fn set_ime_enabled(&mut self, enabled: bool) {
+    unsafe fn set_ime_enabled(this: *mut Self, enabled: bool) {
         unsafe {
             if enabled {
                 IME_USER_DISABLED.store(false, std::sync::atomic::Ordering::Relaxed);
                 // Re-associate IME context with the window
-                ImmAssociateContextEx(self.wnd, std::ptr::null_mut(), IACE_DEFAULT);
+                ImmAssociateContextEx((*this).wnd, std::ptr::null_mut(), IACE_DEFAULT);
             } else {
                 IME_USER_DISABLED.store(true, std::sync::atomic::Ordering::Relaxed);
                 // Disassociate IME context from the window
-                ImmAssociateContextEx(self.wnd, std::ptr::null_mut(), 0);
+                ImmAssociateContextEx((*this).wnd, std::ptr::null_mut(), 0);
             }
         }
     }
 
-    fn set_mouse_cursor(&mut self, cursor_icon: CursorIcon) {
+    unsafe fn set_mouse_cursor(this: *mut Self, cursor_icon: CursorIcon) {
         let cursor_name = match cursor_icon {
             CursorIcon::Default => IDC_ARROW,
             CursorIcon::Help => IDC_HELP,
@@ -200,115 +213,10 @@ impl WindowsDisplay {
             CursorIcon::NESWResize => IDC_SIZENESW,
             CursorIcon::NWSEResize => IDC_SIZENWSE,
         };
-        self.cursor = unsafe { LoadCursorW(NULL as _, cursor_name) };
-        unsafe { SetCursor(self.cursor) };
+        (*this).cursor = unsafe { LoadCursorW(NULL as _, cursor_name) };
+        unsafe { SetCursor((*this).cursor) };
 
-        self.user_cursor = cursor_icon != CursorIcon::Default;
-    }
-    fn set_window_size(&mut self, new_width: u32, new_height: u32) {
-        let mut x = 0;
-        let mut y = 0;
-        let mut final_new_width = new_width;
-        let mut final_new_height = new_height;
-
-        let mut rect: RECT = unsafe { std::mem::zeroed() };
-        if unsafe { GetClientRect(self.wnd, &mut rect as *mut _ as _) } != 0 {
-            x = rect.left;
-            y = rect.bottom;
-        }
-
-        rect.right = (rect.left + new_width as i32) as _;
-        rect.top = (rect.bottom - new_height as i32) as _;
-
-        let win_style = get_win_style(self.fullscreen, self.window_resizable);
-        let win_style_ex: DWORD = unsafe { GetWindowLongA(self.wnd, GWL_EXSTYLE) as _ };
-        if unsafe {
-            AdjustWindowRectEx(
-                &mut rect as *mut _ as _,
-                win_style,
-                false as _,
-                win_style_ex,
-            )
-        } != 0
-        {
-            final_new_width = (rect.right - rect.left) as _;
-            final_new_height = (rect.bottom - rect.top) as _;
-        }
-
-        unsafe {
-            SetWindowPos(
-                self.wnd,
-                HWND_TOP,
-                x,
-                y,
-                final_new_width as i32,
-                final_new_height as i32,
-                SWP_NOMOVE,
-            )
-        };
-    }
-    /// Set the window position in screen coordinates.
-    fn set_window_position(&mut self, new_x: u32, new_y: u32) {
-        let mut rect: RECT = unsafe { std::mem::zeroed() };
-        if unsafe { GetClientRect(self.wnd, &mut rect as *mut _ as _) } != 0 {
-            let mut new_rect = rect;
-            new_rect.right = new_rect.right - new_rect.left + new_x as i32;
-            new_rect.bottom = new_rect.bottom - new_rect.top + new_y as i32;
-            unsafe {
-                SetWindowPos(
-                    self.wnd,
-                    HWND_TOP,
-                    new_x as i32,
-                    new_y as i32,
-                    0,
-                    0,
-                    SWP_NOSIZE,
-                )
-            };
-        }
-    }
-
-    fn set_fullscreen(&mut self, fullscreen: bool) {
-        self.fullscreen = fullscreen as _;
-
-        let win_style: DWORD = get_win_style(self.fullscreen, self.window_resizable);
-
-        unsafe {
-            #[cfg(target_arch = "x86_64")]
-            SetWindowLongPtrA(self.wnd, GWL_STYLE, win_style as _);
-            #[cfg(target_arch = "x86")]
-            SetWindowLong(self.wnd, GWL_STYLE, win_style as _);
-
-            if self.fullscreen {
-                SetWindowPos(
-                    self.wnd,
-                    HWND_TOP,
-                    0,
-                    0,
-                    GetSystemMetrics(SM_CXSCREEN),
-                    GetSystemMetrics(SM_CYSCREEN),
-                    SWP_FRAMECHANGED,
-                );
-            } else {
-                let (w, h) = {
-                    let d = crate::native_display().lock().unwrap();
-                    (d.screen_width, d.screen_height)
-                };
-
-                SetWindowPos(
-                    self.wnd,
-                    HWND_TOP,
-                    0,
-                    0,
-                    // this is probably not correct: with high dpi content_width and window_width are actually different..
-                    w,
-                    h,
-                    SWP_FRAMECHANGED,
-                );
-            }
-
-            ShowWindow(self.wnd, SW_SHOW);
-        };
+        (*this).user_cursor = cursor_icon != CursorIcon::Default;
     }
 }
 
@@ -526,36 +434,39 @@ unsafe extern "system" fn win32_wndproc(
     if display_ptr == 0 {
         return DefWindowProcW(hwnd, umsg, wparam, lparam);
     }
-    let payload = &mut *(display_ptr as *mut WindowsDisplay);
-    let event_handler = payload.event_handler.as_mut().unwrap();
+    let payload = display_ptr as *mut WindowsDisplay;
+    let result = window_message(payload, hwnd, umsg, wparam, lparam);
+    WindowsDisplay::flush_events(payload);
+    result
+}
 
+// Keep all display borrows local to a field access. DefWindowProc, IME calls,
+// SetWindowPos and application callbacks can synchronously re-enter this code.
+unsafe fn window_message(
+    payload: *mut WindowsDisplay,
+    hwnd: HWND,
+    umsg: UINT,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
     match umsg {
         WM_CLOSE => {
-            let mut d = crate::native_display().lock().unwrap();
-            // only give user a chance to intervene when sapp_quit() wasn't already called
-            if !d.quit_ordered {
-                // if window should be closed and event handling is enabled, give user code
-                // a change to intervene via sapp_cancel_quit()
-                d.quit_requested = true;
-                drop(d);
-                // the prevent event may require access to native_display
-                event_handler.quit_requested_event();
-                // Re-acquire native_display
-                d = crate::native_display().lock().unwrap();
-                // if user code hasn't intervened, quit the app
-                if d.quit_requested {
-                    d.quit_ordered = true;
-                }
-            }
-            if d.quit_ordered {
-                PostQuitMessage(0);
+            (*payload).events.quit_requested_event();
+            return 0;
+        }
+        WM_DPICHANGED => {
+            let dpi = LOWORD(wparam as _) as u32;
+            if dpi != 0 && lparam != 0 {
+                // lParam belongs to Windows and is valid only during this call.
+                let suggested = *(lparam as *const RECT);
+                WindowsDisplay::change_dpi(payload, dpi, suggested);
             }
             return 0;
         }
         WM_SYSCOMMAND => {
             match wparam & 0xFFF0 {
                 SC_SCREENSAVE | SC_MONITORPOWER => {
-                    if payload.fullscreen {
+                    if (*payload).fullscreen {
                         // disable screen saver and blanking in fullscreen mode
                         return 0;
                     }
@@ -571,66 +482,75 @@ unsafe extern "system" fn win32_wndproc(
             return 1;
         }
         WM_SIZE => {
-            if payload.cursor_grabbed {
-                update_clip_rect(hwnd);
-            }
-
+            WindowsDisplay::size_changed(payload);
             let iconified = wparam == SIZE_MINIMIZED;
-            if iconified != payload.iconified {
-                payload.iconified = iconified;
+            if iconified != (*payload).iconified {
+                (*payload).iconified = iconified;
                 if iconified {
-                    event_handler.window_minimized_event();
+                    (*payload).events.window_minimized_event();
                 } else {
-                    event_handler.window_restored_event();
+                    (*payload).events.window_restored_event();
                 }
             }
         }
         WM_SETCURSOR => {
-            if payload.user_cursor && LOWORD(lparam as _) == HTCLIENT as _ {
-                SetCursor(payload.cursor);
+            if (*payload).user_cursor && LOWORD(lparam as _) == HTCLIENT as _ {
+                SetCursor((*payload).cursor);
 
                 return 1;
             }
         }
         WM_LBUTTONDOWN => {
-            let mouse_x = payload.mouse_x;
-            let mouse_y = payload.mouse_y;
-            event_handler.mouse_button_down_event(MouseButton::Left, mouse_x, mouse_y);
+            let mouse_x = (*payload).mouse_x;
+            let mouse_y = (*payload).mouse_y;
+            (*payload)
+                .events
+                .mouse_button_down_event(MouseButton::Left, mouse_x, mouse_y);
         }
         WM_RBUTTONDOWN => {
-            let mouse_x = payload.mouse_x;
-            let mouse_y = payload.mouse_y;
+            let mouse_x = (*payload).mouse_x;
+            let mouse_y = (*payload).mouse_y;
 
-            event_handler.mouse_button_down_event(MouseButton::Right, mouse_x, mouse_y);
+            (*payload)
+                .events
+                .mouse_button_down_event(MouseButton::Right, mouse_x, mouse_y);
         }
         WM_MBUTTONDOWN => {
-            let mouse_x = payload.mouse_x;
-            let mouse_y = payload.mouse_y;
+            let mouse_x = (*payload).mouse_x;
+            let mouse_y = (*payload).mouse_y;
 
-            event_handler.mouse_button_down_event(MouseButton::Middle, mouse_x, mouse_y);
+            (*payload)
+                .events
+                .mouse_button_down_event(MouseButton::Middle, mouse_x, mouse_y);
         }
         WM_LBUTTONUP => {
-            let mouse_x = payload.mouse_x;
-            let mouse_y = payload.mouse_y;
+            let mouse_x = (*payload).mouse_x;
+            let mouse_y = (*payload).mouse_y;
 
-            event_handler.mouse_button_up_event(MouseButton::Left, mouse_x, mouse_y);
+            (*payload)
+                .events
+                .mouse_button_up_event(MouseButton::Left, mouse_x, mouse_y);
         }
         WM_RBUTTONUP => {
-            let mouse_x = payload.mouse_x;
-            let mouse_y = payload.mouse_y;
+            let mouse_x = (*payload).mouse_x;
+            let mouse_y = (*payload).mouse_y;
 
-            event_handler.mouse_button_up_event(MouseButton::Right, mouse_x, mouse_y);
+            (*payload)
+                .events
+                .mouse_button_up_event(MouseButton::Right, mouse_x, mouse_y);
         }
         WM_MBUTTONUP => {
-            let mouse_x = payload.mouse_x;
-            let mouse_y = payload.mouse_y;
+            let mouse_x = (*payload).mouse_x;
+            let mouse_y = (*payload).mouse_y;
 
-            event_handler.mouse_button_up_event(MouseButton::Middle, mouse_x, mouse_y);
+            (*payload)
+                .events
+                .mouse_button_up_event(MouseButton::Middle, mouse_x, mouse_y);
         }
 
         WM_MOUSEMOVE => {
-            payload.mouse_x = GET_X_LPARAM(lparam) as f32 * payload.mouse_scale;
-            payload.mouse_y = GET_Y_LPARAM(lparam) as f32 * payload.mouse_scale;
+            (*payload).mouse_x = GET_X_LPARAM(lparam) as f32 * (*payload).mouse_scale;
+            (*payload).mouse_y = GET_Y_LPARAM(lparam) as f32 * (*payload).mouse_scale;
             // mouse enter was not handled by miniquad anyway
             // if !_sapp.win32_mouse_tracked {
             //     _sapp.win32_mouse_tracked = true;
@@ -647,13 +567,13 @@ unsafe extern "system" fn win32_wndproc(
             //     );
             // }
 
-            let mouse_x = payload.mouse_x;
-            let mouse_y = payload.mouse_y;
+            let mouse_x = (*payload).mouse_x;
+            let mouse_y = (*payload).mouse_y;
 
-            event_handler.mouse_motion_event(mouse_x, mouse_y);
+            (*payload).events.mouse_motion_event(mouse_x, mouse_y);
         }
 
-        WM_MOVE if payload.cursor_grabbed => {
+        WM_MOVE if (*payload).cursor_grabbed => {
             update_clip_rect(hwnd);
         }
 
@@ -671,7 +591,7 @@ unsafe extern "system" fn win32_wndproc(
                 panic!("failed to retrieve raw input data");
             }
 
-            let mouse_scale = payload.mouse_scale;
+            let mouse_scale = (*payload).mouse_scale;
             let mut dx = data.data.mouse().lLastX as f32 * mouse_scale;
             let mut dy = data.data.mouse().lLastY as f32 * mouse_scale;
 
@@ -686,7 +606,7 @@ unsafe extern "system" fn win32_wndproc(
                 dy = dy / 65535.0 * height;
             }
 
-            event_handler.raw_mouse_motion(dx, dy);
+            (*payload).events.raw_mouse_motion(dx, dy);
         }
 
         WM_MOUSELEAVE => {
@@ -698,11 +618,15 @@ unsafe extern "system" fn win32_wndproc(
             // );
         }
         WM_MOUSEWHEEL => {
-            event_handler.mouse_wheel_event(0.0, (HIWORD(wparam as _) as i16) as f32);
+            (*payload)
+                .events
+                .mouse_wheel_event(0.0, (HIWORD(wparam as _) as i16) as f32);
         }
 
         WM_MOUSEHWHEEL => {
-            event_handler.mouse_wheel_event((HIWORD(wparam as _) as i16) as f32, 0.0);
+            (*payload)
+                .events
+                .mouse_wheel_event((HIWORD(wparam as _) as i16) as f32, 0.0);
         }
         WM_CHAR => {
             let chr = wparam as u32;
@@ -710,7 +634,7 @@ unsafe extern "system" fn win32_wndproc(
             let mods = key_mods();
             if chr > 0 {
                 if let Some(chr) = char::from_u32(chr) {
-                    event_handler.char_event(chr, mods, repeat);
+                    (*payload).events.char_event(chr, mods, repeat);
                 }
             }
             return 0;
@@ -746,7 +670,7 @@ unsafe extern "system" fn win32_wndproc(
                             for i in 0..char_count {
                                 let chr = buffer[i];
                                 if let Some(c) = char::from_u32(chr as u32) {
-                                    event_handler.char_event(c, mods, false);
+                                    (*payload).events.char_event(c, mods, false);
                                 }
                             }
                         }
@@ -844,7 +768,7 @@ unsafe extern "system" fn win32_wndproc(
             let keycode = keycodes::translate_keycode(keycode_raw);
             let mods = key_mods();
             let repeat = !!(lparam & 0x40000000) != 0;
-            event_handler.key_down_event(keycode, mods, repeat);
+            (*payload).events.key_down_event(keycode, mods, repeat);
             // Pass to DefWindowProc for IME to work properly
             return DefWindowProcW(hwnd, umsg, wparam, lparam);
         }
@@ -852,40 +776,28 @@ unsafe extern "system" fn win32_wndproc(
             let keycode = HIWORD(lparam as _) as u32 & 0x1FF;
             let keycode = keycodes::translate_keycode(keycode);
             let mods = key_mods();
-            event_handler.key_up_event(keycode, mods);
+            (*payload).events.key_up_event(keycode, mods);
             // IMPORTANT: Pass to DefWindowProc for IME to work properly
             return DefWindowProcW(hwnd, umsg, wparam, lparam);
         }
         WM_ENTERSIZEMOVE | WM_ENTERMENULOOP => {
             SetTimer(
                 hwnd,
-                &mut payload.modal_resizing_timer as *mut _ as usize,
+                std::ptr::addr_of!((*payload).modal_resizing_timer) as usize,
                 10,
                 None,
             );
         }
         WM_TIMER => {
-            if wparam == &mut payload.modal_resizing_timer as *mut _ as usize {
-                if payload.update_dimensions(hwnd) {
-                    let d = crate::native_display().lock().unwrap();
-                    let width = d.screen_width as f32;
-                    let height = d.screen_height as f32;
-                    drop(d);
-                    payload
-                        .event_handler
-                        .as_mut()
-                        .unwrap()
-                        .resize_event(width, height);
-                }
-
-                payload.event_handler.as_mut().unwrap().update();
-                payload.event_handler.as_mut().unwrap().draw();
-
-                SwapBuffers(payload.dc);
+            if wparam == std::ptr::addr_of!((*payload).modal_resizing_timer) as usize {
+                WindowsDisplay::frame(payload, true);
             }
         }
         WM_EXITSIZEMOVE | WM_EXITMENULOOP => {
-            KillTimer(hwnd, &mut payload.modal_resizing_timer as *mut _ as usize);
+            KillTimer(
+                hwnd,
+                std::ptr::addr_of!((*payload).modal_resizing_timer) as usize,
+            );
         }
         WM_DROPFILES => {
             let hdrop = wparam as HDROP;
@@ -904,9 +816,9 @@ unsafe extern "system" fn win32_wndproc(
         }
         WM_ACTIVATE => {
             if LOWORD(wparam as _) == WA_ACTIVE || LOWORD(wparam as _) == WA_CLICKACTIVE {
-                event_handler.window_restored_event();
+                (*payload).events.window_restored_event();
             } else {
-                event_handler.window_minimized_event();
+                (*payload).events.window_minimized_event();
             }
         }
         WM_SETFOCUS => {
@@ -1218,63 +1130,6 @@ impl WindowsDisplay {
             unsafe extern "C" fn(),
         >(proc_ptr))
     }
-
-    /// Publish actual client pixels and window position as one snapshot.
-    /// Returns true if size or position has changed.
-    unsafe fn update_dimensions(&mut self, hwnd: HWND) -> bool {
-        // Query Windows before locking shared state. Never hold the lock over a
-        // window-management API that might dispatch synchronous messages.
-        let mut rect: RECT = std::mem::zeroed();
-        let mut client: RECT = std::mem::zeroed();
-        if GetWindowRect(hwnd, &mut rect) == 0 || GetClientRect(hwnd, &mut client) == 0 {
-            return false;
-        }
-        // Both native high-DPI rendering and the existing low-DPI mode use
-        // client-coordinate pixels. A logical round trip would discard pixels
-        // at fractional scales. Retain the existing nonzero minimized policy.
-        let width = (client.right - client.left).max(1);
-        let height = (client.bottom - client.top).max(1);
-        let position = (rect.left as u32, rect.top as u32);
-        let mut d = crate::native_display().lock().unwrap();
-        let changed =
-            (width, height) != (d.screen_width, d.screen_height) || position != d.screen_position;
-        d.screen_width = width;
-        d.screen_height = height;
-        d.screen_position = position;
-        changed
-    }
-
-    fn process_request(&mut self, request: Request) {
-        use Request::*;
-        match request {
-            ScheduleUpdate => {
-                self.update_requested = true;
-            }
-            SetCursorGrab(grab) => self.set_cursor_grab(grab),
-            ShowMouse(show) => self.show_mouse(show),
-            SetMouseCursor(icon) => self.set_mouse_cursor(icon),
-            SetWindowSize {
-                new_width,
-                new_height,
-            } => self.set_window_size(new_width as _, new_height as _),
-            SetWindowPosition { new_x, new_y } => self.set_window_position(new_x, new_y),
-            SetFullscreen(fullscreen) => self.set_fullscreen(fullscreen),
-            ShowKeyboard(show) => {
-                // On Windows, ShowKeyboard controls IME state
-                if show {
-                    IME_USER_DISABLED.store(false, std::sync::atomic::Ordering::Relaxed);
-                } else {
-                    IME_USER_DISABLED.store(true, std::sync::atomic::Ordering::Relaxed);
-                }
-            }
-            SetImePosition { x, y } => {
-                self.set_ime_position(x, y);
-            }
-            SetImeEnabled(enabled) => {
-                self.set_ime_enabled(enabled);
-            }
-        }
-    }
 }
 
 pub fn run<F>(conf: &Conf, f: F)
@@ -1297,6 +1152,20 @@ where
             window_resizable: conf.window_resizable,
             cursor_grabbed: false,
             iconified: false,
+            high_dpi: conf.high_dpi,
+            window_dpi,
+            dpi_api,
+            normal_size: dpi::ClientSize::new(
+                (conf.window_width, conf.window_height),
+                dpi::BASE_DPI,
+            ),
+            normal_client_size: (0, 0),
+            restore_size_pending: false,
+            windowed_placement: None,
+            geometry_depth: 0,
+            dpi_changed: false,
+            pending_dpi: None,
+            events: Default::default(),
             mouse_scale: 1.,
             window_scale: if conf.high_dpi {
                 window_dpi as f32 / dpi::BASE_DPI as f32
@@ -1327,7 +1196,7 @@ where
             ..NativeDisplayData::new(conf.window_width, conf.window_height, tx, clipboard)
         });
 
-        display.update_dimensions(wnd);
+        WindowsDisplay::publish_geometry(&mut display);
 
         let mut wgl = wgl::Wgl::new(&mut display);
         let gl_ctx = wgl.create_context(
@@ -1343,9 +1212,13 @@ where
         ShowWindow(wnd, SW_SHOW);
         // ShowWindow can apply startup placement/minimization supplied by a host.
         // Make the initial application callback observe the resulting client size.
-        display.update_dimensions(wnd);
+        WindowsDisplay::publish_geometry(&mut display);
 
         // Register for raw mouse input (needed for raw_mouse_motion event)
+        let mut client: RECT = std::mem::zeroed();
+        if GetClientRect(wnd, &mut client) != 0 {
+            display.normal_client_size = (client.right - client.left, client.bottom - client.top);
+        }
         let mut rawinputdevice: RAWINPUTDEVICE = std::mem::zeroed();
         rawinputdevice.usUsagePage = HID_USAGE_PAGE_GENERIC;
         rawinputdevice.usUsage = HID_USAGE_GENERIC_MOUSE;
@@ -1362,15 +1235,17 @@ where
 
         display.event_handler = Some(f());
 
+        let display = &mut display as *mut WindowsDisplay;
+
         #[cfg(target_arch = "x86_64")]
-        SetWindowLongPtrA(wnd, GWLP_USERDATA, &mut display as *mut _ as isize);
+        SetWindowLongPtrA(wnd, GWLP_USERDATA, display as isize);
         #[cfg(target_arch = "x86")]
-        SetWindowLong(wnd, GWLP_USERDATA, &mut display as *mut _ as isize);
+        SetWindowLong(wnd, GWLP_USERDATA, display as isize);
 
         let mut done = false;
         while !(done || crate::native_display().lock().unwrap().quit_ordered) {
             while let Ok(request) = rx.try_recv() {
-                display.process_request(request);
+                WindowsDisplay::process_request(display, request);
             }
 
             let mut dispatch_message = |mut msg: MSG| {
@@ -1382,7 +1257,7 @@ where
                 }
             };
             let mut msg: MSG = std::mem::zeroed();
-            let block_on_wait = conf.platform.blocking_event_loop && !display.update_requested;
+            let block_on_wait = conf.platform.blocking_event_loop && !(*display).update_requested;
             if block_on_wait {
                 GetMessageW(&mut msg as *mut _ as _, NULL as _, 0, 0);
                 dispatch_message(msg);
@@ -1392,30 +1267,13 @@ where
                 }
             }
 
-            if display.update_dimensions(wnd) {
-                let d = crate::native_display().lock().unwrap();
-                let width = d.screen_width as f32;
-                let height = d.screen_height as f32;
-                drop(d);
-                display
-                    .event_handler
-                    .as_mut()
-                    .unwrap()
-                    .resize_event(width, height);
-            }
-            if !conf.platform.blocking_event_loop || display.update_requested {
-                display.update_requested = false;
-                display.event_handler.as_mut().unwrap().update();
-                display.event_handler.as_mut().unwrap().draw();
-
-                SwapBuffers(display.dc);
-            }
+            WindowsDisplay::frame(display, !conf.platform.blocking_event_loop);
             if crate::native_display().lock().unwrap().quit_requested {
-                PostMessageW(display.wnd, WM_CLOSE, 0, 0);
+                PostMessageW((*display).wnd, WM_CLOSE, 0, 0);
             }
         }
 
-        (display.libopengl32.wglDeleteContext)(gl_ctx);
+        ((*display).libopengl32.wglDeleteContext)(gl_ctx);
         DestroyWindow(wnd);
     }
 }

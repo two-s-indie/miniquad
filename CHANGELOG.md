@@ -9,11 +9,15 @@ Completed changes in the [two-s-indie Miniquad fork](https://github.com/two-s-in
 - Added this fork changelog and repository instructions in `AGENTS.md` requiring changelog updates with commits and recurring checks for undocumented changes.
 - Added a DPI diagnostic example with geometry/input logging, a centered hit-test rectangle, runtime resize controls, and high-DPI, low-DPI, odd-size, and blocking-loop modes. Added a validation guide with the recorded 175% startup baseline and instructions for testing the paired Macroquad example against this checkout.
 - Added Windows DPI fallback and rounding tests, real-window startup checks in isolated processes, and a PerMonitorV2 manifest fixture covering both high-DPI and low-DPI rendering.
+- Added Windows runtime DPI regression tests using real windows and injected DPI messages: fractional round trips, signed positions, callback consistency and reentrancy, application/native resizing, minimize/maximize and fullscreen restore, stationary pointer refresh, and normal, blocking, and modal event loops.
 
 ### Fixed
 
 - **Windows startup DPI:** Establish per-monitor awareness before creating any window when the host has not already chosen an awareness mode. Query DPI from the actual main window and correct its hidden client geometry using DPI-aware border metrics before showing it after WGL initialization. Newer DPI APIs are loaded dynamically, with checked legacy and failed-query fallbacks.
 - **Windows framebuffer dimensions:** Publish the actual client size without the fractional-scale divide/truncate/multiply round trip, and update size and position together. Normal and fullscreen startup windows remain hidden until the graphics context is ready.
+- **Windows DPI transitions:** Handle `WM_DPICHANGED`, retain fractional scales, and publish the resulting scale, actual framebuffer size, and position together before callbacks. Normal windows use the suggested position and target-DPI borders while retaining logical client-size intent without cumulative rounding. Low-DPI rendering keeps scale 1 and unscaled client dimensions.
+- **Windows window states and redraw:** Preserve minimized, maximized, and fullscreen states during DPI changes and apply normal-size intent on restore, including restoring saved windowed placement when leaving fullscreen. DPI changes wake blocking loops even when framebuffer size stays unchanged. Refresh absolute pointer coordinates and cursor clipping after transitions; raw relative motion remains in hardware units.
+- **Windows callback delivery:** Buffer events during reentrant native geometry operations and share geometry publication between the main loop and modal resize timer. Resize callbacks report framebuffer changes rather than position-only moves, and observe the updated DPI. Runtime size requests use DPI-aware borders without scaling framebuffer dimensions again.
 
 ### Changed
 

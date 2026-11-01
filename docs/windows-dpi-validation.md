@@ -202,7 +202,85 @@ The manifest cases assert that awareness was already set before Miniquad ran.
 These startup tests do not validate dynamic DPI transitions; `WM_DPICHANGED`
 handling remains outside this step.
 
-## Remaining runtime checks
+## Step 3: runtime transitions (2026-11-01)
+
+`WM_DPICHANGED` now copies the message rectangle and retains the new DPI for a
+geometry transaction. Normal windows use the suggested signed position, stable
+logical client-size intent, and target-DPI borders. The suggested outer size is
+not multiplied again. New DPI messages raised during sizing are handled before
+the resulting scale, actual client size, and position are published together.
+
+Application framebuffer requests and native/user resizes replace the normal-size
+intent. The rounded result of a DPI resize does not. If Windows constrains a DPI
+resize, the actual client dimensions are published, but the original intent is
+retained for a later transition. Border correction is bounded; there is no frame
+polling loop that repeatedly forces the requested size.
+
+Minimized windows remain minimized. Maximized windows use their suggested outer
+geometry; fullscreen windows cover the destination monitor. These states retain
+normal-size intent for restore. Leaving fullscreen restores saved windowed
+placement through `SetWindowPlacement`; fullscreen entry still uses the existing
+primary-monitor policy. Low-DPI rendering keeps scale 1 and unscaled client size,
+while non-client borders use the window DPI.
+
+Native geometry operations buffer application events. Callbacks run after the
+transaction, with the handler owned outside the native state and no display mutex
+held. The main loop and modal timer use the same publication/delivery path.
+Only framebuffer changes cause `resize_event`; scale-only changes still request
+a frame. A posted wake-up also handles DPI messages sent while `GetMessage` is
+waiting. Absolute mouse coordinates are refreshed from the stationary OS cursor
+after a transition; raw relative motion is unchanged.
+
+### Automated results
+
+The full Windows `cargo test --offline --all-targets -- --nocapture` passed,
+including the earlier startup cases and four new isolated runtime cases: high
+DPI and low DPI, each with normal and blocking event loops in a PerMonitorV2
+process. The runtime tests create real HWND/WGL windows and inject
+`WM_DPICHANGED`; they do **not** change the actual monitor DPI.
+
+Verified by these injected-message tests:
+
+- Three round trips through 100%, 125%, 150%, 175%, and 200% with 801 x 601
+  logical intent, without accumulated size drift or intermediate resize callbacks.
+- Signed placement at (-20, -10), native client/public framebuffer agreement,
+  and the new scale visible inside resize callbacks.
+- A 1173 x 853 framebuffer request and a 987 x 731 native resize both become
+  the new intent and survive subsequent DPI round trips.
+- Minimize/maximize and fullscreen restore, including a scale-only maximized
+  transition that redraws without a resize callback.
+- Stationary pointer refresh, blocking-loop wake-up without input, modal timer
+  delivery, and a nested DPI message sent from inside a resize callback.
+
+Rational-size unit tests cover repeated rounding and invalid/overflowing sizes.
+Rust 1.70 Windows library compilation and all-target Linux/Wasm checks also
+passed. Existing compiler warnings remain in unrelated code; Cargo also reports
+an incremental-cache finalization warning on this machine.
+
+The sibling Macroquad diagnostic was rebuilt with the local Miniquad patch and
+run in blocking mode with odd dimensions. Injected transitions produced:
+
+| Rendering scale | Framebuffer | Macroquad logical size (approximately) |
+| --- | --- | --- |
+| 1.25 | 1001 x 751 | 800.8 x 600.8 |
+| 1.5 | 1202 x 902 | 801.3333 x 601.3333 |
+| 1.75 | 1402 x 1052 | 801.1429 x 601.1429 |
+| 2 | 1602 x 1202 | 801 x 601 |
+| 1 | 801 x 601 | 801 x 601 |
+
+It redrew after each transition and refreshed its logical mouse coordinates.
+The low-DPI diagnostic retained scale 1 and 801 x 601 for all injected values.
+These checks required no additional Macroquad source changes. Local logs are in
+`target/dpi-validation/step3-macroquad-{high,low}.log` (not versioned).
+
+Repeat the committed runtime checks with:
+
+```powershell
+cargo test --test windows_dpi_transition -- --nocapture
+cargo test --lib native::windows::dpi::tests
+```
+
+## Remaining physical-monitor checks
 
 Record actual display scales, awareness mode, requested size, native client
 size, reported framebuffer, logical size, mouse behavior, and redraw behavior.
@@ -221,5 +299,7 @@ Keep baseline observations separate from results after implementing the fix.
 - Check cursor clipping, cached mouse coordinates, and IME placement. Use the
   existing `ime_test` example for IME behavior; this diagnostic has no text input.
 
-These monitor-transition checks remain unverified. Passing startup checks and
-builds is not evidence of correct monitor-transition behavior.
+These physical-monitor checks remain unverified. Passing startup, injected DPI
+message tests, and builds does not verify Windows' actual monitor selection,
+message ordering during a physical drag, or display-settings changes. Visual
+text/hit-test accuracy, cursor grabbing and IME still need interactive validation.

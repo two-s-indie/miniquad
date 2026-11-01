@@ -47,8 +47,12 @@
 //! including when the host has a per-monitor-aware manifest.
 //!
 //! Windows runtime [`set_window_size`](super::window::set_window_size) requests
-//! are already in framebuffer pixels and are not scaled again. Startup scaling
-//! does not yet imply support for subsequent monitor-DPI changes on Windows.
+//! are already in framebuffer pixels and are not scaled again. On per-monitor-aware
+//! Windows windows, DPI changes preserve the normal window's logical client-size
+//! intent and publish the new scale with the actual framebuffer dimensions before
+//! callbacks. Fractional scales round only at the final pixel boundary. Minimized,
+//! maximized and fullscreen windows keep their state; normal-size intent is applied
+//! on restore. DPI changes also request a frame in blocking event loops.
 //!
 //! [`dpi_scale`]: super::window::dpi_scale
 //! [`screen_size`]: super::window::screen_size

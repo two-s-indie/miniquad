@@ -288,6 +288,8 @@ pub mod window {
     /// On Windows, these are framebuffer-pixel dimensions, even with high DPI
     /// enabled. Convert logical units using [`dpi_scale`] once before requesting
     /// the size. The operating system may constrain the resulting client area.
+    /// Requests made while minimized, maximized, or fullscreen update the normal
+    /// window's size intent, which is applied when it returns to normal state.
     pub fn set_window_size(new_width: u32, new_height: u32) {
         let d = native_display().lock().unwrap();
         #[cfg(target_os = "android")]
