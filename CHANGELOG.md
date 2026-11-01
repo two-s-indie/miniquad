@@ -8,6 +8,16 @@ Completed changes in the [two-s-indie Miniquad fork](https://github.com/two-s-in
 
 - Added this fork changelog and repository instructions in `AGENTS.md` requiring changelog updates with commits and recurring checks for undocumented changes.
 - Added a DPI diagnostic example with geometry/input logging, a centered hit-test rectangle, runtime resize controls, and high-DPI, low-DPI, odd-size, and blocking-loop modes. Added a validation guide with the recorded 175% startup baseline and instructions for testing the paired Macroquad example against this checkout.
+- Added Windows DPI fallback and rounding tests, real-window startup checks in isolated processes, and a PerMonitorV2 manifest fixture covering both high-DPI and low-DPI rendering.
+
+### Fixed
+
+- **Windows startup DPI:** Establish per-monitor awareness before creating any window when the host has not already chosen an awareness mode. Query DPI from the actual main window and correct its hidden client geometry using DPI-aware border metrics before showing it after WGL initialization. Newer DPI APIs are loaded dynamically, with checked legacy and failed-query fallbacks.
+- **Windows framebuffer dimensions:** Publish the actual client size without the fractional-scale divide/truncate/multiply round trip, and update size and position together. Normal and fullscreen startup windows remain hidden until the graphics context is ready.
+
+### Changed
+
+- **Windows high-DPI startup sizing:** `Conf.window_width` and `Conf.window_height` now specify logical client dimensions for normal high-DPI windows. For example, 800 x 600 at 175% becomes a 1400 x 1050 framebuffer. Runtime size requests remain in framebuffer pixels; low-DPI startup keeps unscaled dimensions and rendering scale 1, including in a per-monitor-aware host.
 
 ## 2026-11-01
 

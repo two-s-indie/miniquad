@@ -284,6 +284,10 @@ pub mod window {
     }
 
     /// Set the application's window size.
+    ///
+    /// On Windows, these are framebuffer-pixel dimensions, even with high DPI
+    /// enabled. Convert logical units using [`dpi_scale`] once before requesting
+    /// the size. The operating system may constrain the resulting client area.
     pub fn set_window_size(new_width: u32, new_height: u32) {
         let d = native_display().lock().unwrap();
         #[cfg(target_os = "android")]

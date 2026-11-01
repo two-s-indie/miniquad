@@ -38,6 +38,18 @@
 //! dpi_scale   -> 1.0
 //! ```
 //!
+//! On Windows, a normal window's initial `window_width` and `window_height`
+//! are logical client dimensions when `high_dpi` is true. They are scaled using
+//! the actual window's DPI, with rounding only at the final pixel boundary.
+//! Existing application/host DPI awareness is respected; an explicitly DPI-unaware
+//! host therefore still reports a rendering scale of 1. With `high_dpi = false`,
+//! Windows keeps unscaled client dimensions and reports a rendering scale of 1,
+//! including when the host has a per-monitor-aware manifest.
+//!
+//! Windows runtime [`set_window_size`](super::window::set_window_size) requests
+//! are already in framebuffer pixels and are not scaled again. Startup scaling
+//! does not yet imply support for subsequent monitor-DPI changes on Windows.
+//!
 //! [`dpi_scale`]: super::window::dpi_scale
 //! [`screen_size`]: super::window::screen_size
 
@@ -208,10 +220,12 @@ pub struct Conf {
     pub window_title: String,
 
     /// Preferred window width (ignored on WASM/Android).
+    /// On Windows, logical client units at startup when `high_dpi` is true.
     /// Defaults to `800`.
     pub window_width: i32,
 
     /// Preferred window height (ignored on WASM/Android).
+    /// On Windows, logical client units at startup when `high_dpi` is true.
     /// Defaults to `600`.
     pub window_height: i32,
 

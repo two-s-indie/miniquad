@@ -19,7 +19,6 @@ use winapi::{
         imm::{ImmGetContext, ImmReleaseContext, HIMC},
         libloaderapi::{GetModuleHandleW, GetProcAddress},
         shellapi::{DragAcceptFiles, DragQueryFileW, HDROP},
-        shellscalingapi::*,
         wingdi::*,
         winuser::*,
     },
@@ -95,6 +94,7 @@ extern "system" {
 const IACE_CHILDREN: DWORD = 0x0001;
 
 mod clipboard;
+mod dpi;
 mod keycodes;
 mod libopengl32;
 mod wgl;
@@ -103,11 +103,9 @@ use libopengl32::LibOpengl32;
 
 pub(crate) struct WindowsDisplay {
     fullscreen: bool,
-    dpi_aware: bool,
     window_resizable: bool,
     cursor_grabbed: bool,
     iconified: bool,
-    content_scale: f32,
     window_scale: f32,
     mouse_scale: f32,
     show_cursor: bool,
@@ -1035,13 +1033,7 @@ unsafe fn set_icon(wnd: HWND, icon: &Icon) {
     }
 }
 
-unsafe fn create_window(
-    window_title: &str,
-    fullscreen: bool,
-    resizable: bool,
-    width: i32,
-    height: i32,
-) -> (HWND, HDC) {
+unsafe fn create_window(conf: &Conf, dpi_api: &dpi::DpiApi) -> (HWND, HDC, u32) {
     let mut wndclassw: WNDCLASSW = std::mem::zeroed();
 
     // CS_OWNDC is required for OpenGL
@@ -1065,12 +1057,13 @@ unsafe fn create_window(
         bottom: 0,
     };
 
-    if fullscreen {
-        win_style = WS_POPUP | WS_SYSMENU | WS_VISIBLE;
+    if conf.fullscreen {
+        // Even fullscreen startup must stay hidden until WGL is initialized.
+        win_style = WS_POPUP | WS_SYSMENU;
         rect.right = GetSystemMetrics(SM_CXSCREEN);
         rect.bottom = GetSystemMetrics(SM_CYSCREEN);
     } else {
-        win_style = if resizable {
+        win_style = if conf.window_resizable {
             WS_CLIPSIBLINGS
                 | WS_CLIPCHILDREN
                 | WS_CAPTION
@@ -1082,15 +1075,28 @@ unsafe fn create_window(
             WS_CLIPSIBLINGS | WS_CLIPCHILDREN | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX
         };
 
-        rect.right = width;
-        rect.bottom = height;
+        rect.right = dpi::startup_pixels(conf.window_width, dpi::BASE_DPI)
+            .expect("Invalid Windows startup width");
+        rect.bottom = dpi::startup_pixels(conf.window_height, dpi::BASE_DPI)
+            .expect("Invalid Windows startup height");
     }
 
-    AdjustWindowRectEx(&rect as *const _ as _, win_style, false as _, win_ex_style);
-    let win_width = rect.right - rect.left;
-    let win_height = rect.bottom - rect.top;
+    let client_rect = rect;
+    if AdjustWindowRectEx(&mut rect, win_style, false as _, win_ex_style) == 0 {
+        rect = client_rect;
+    }
+    let win_width = rect
+        .right
+        .checked_sub(rect.left)
+        .filter(|&v| v > 0)
+        .expect("Invalid Windows outer width");
+    let win_height = rect
+        .bottom
+        .checked_sub(rect.top)
+        .filter(|&v| v > 0)
+        .expect("Invalid Windows outer height");
     let class_name = "MINIQUADAPP\0".encode_utf16().collect::<Vec<u16>>();
-    let mut window_name = window_title.encode_utf16().collect::<Vec<u16>>();
+    let mut window_name = conf.window_title.encode_utf16().collect::<Vec<u16>>();
     window_name.push(0);
     let hwnd = CreateWindowExW(
         win_ex_style,                // dwExStyle
@@ -1114,9 +1120,35 @@ unsafe fn create_window(
     let dc = GetDC(hwnd);
     assert!(!dc.is_null());
 
+    let mut window_dpi = dpi_api.window_dpi(hwnd, dc);
+    if !conf.fullscreen {
+        // A larger window can overlap a different monitor. Requery after sizing,
+        // always deriving from the original request rather than a rounded result.
+        // Bound retries so OS constraints cannot cause a startup resize loop.
+        for _ in 0..3 {
+            let render_dpi = if conf.high_dpi {
+                window_dpi
+            } else {
+                dpi::BASE_DPI
+            };
+            let size = (
+                dpi::startup_pixels(conf.window_width, render_dpi)
+                    .expect("Invalid Windows startup width"),
+                dpi::startup_pixels(conf.window_height, render_dpi)
+                    .expect("Invalid Windows startup height"),
+            );
+            let resized = dpi_api.resize_client(hwnd, size, win_style, win_ex_style, window_dpi);
+            let actual_dpi = dpi_api.window_dpi(hwnd, dc);
+            if actual_dpi == window_dpi || !resized {
+                window_dpi = actual_dpi;
+                break;
+            }
+            window_dpi = actual_dpi;
+        }
+    }
     DragAcceptFiles(hwnd, TRUE);
 
-    (hwnd, dc)
+    (hwnd, dc, window_dpi)
 }
 
 unsafe fn create_msg_window() -> (HWND, HDC) {
@@ -1187,78 +1219,29 @@ impl WindowsDisplay {
         >(proc_ptr))
     }
 
-    /// updates current window and framebuffer size from the window's client rect,
-    /// and window position from the window's rect.
-    /// returns true if size or position has changed
+    /// Publish actual client pixels and window position as one snapshot.
+    /// Returns true if size or position has changed.
     unsafe fn update_dimensions(&mut self, hwnd: HWND) -> bool {
-        let mut d = crate::native_display().lock().unwrap();
+        // Query Windows before locking shared state. Never hold the lock over a
+        // window-management API that might dispatch synchronous messages.
         let mut rect: RECT = std::mem::zeroed();
-
-        // Get the outer rectangle of the window in screen coordinates
-        if GetWindowRect(hwnd, &mut rect as *mut _ as _) != 0 {
-            // Get the client area rectangle in client coordinates
-            let mut client_rect: RECT = std::mem::zeroed();
-            if GetClientRect(hwnd, &mut client_rect as *mut _ as _) != 0 {
-                // Calculate window width and height based on the client area
-                let window_width =
-                    ((client_rect.right - client_rect.left) as f32 / self.window_scale) as i32;
-                let window_height =
-                    ((client_rect.bottom - client_rect.top) as f32 / self.window_scale) as i32;
-
-                // Prevent a framebuffer size of 0 when the window is minimized
-                let fb_width = ((window_width as f32 * self.content_scale) as i32).max(1);
-                let fb_height = ((window_height as f32 * self.content_scale) as i32).max(1);
-
-                // Check for size changes
-                if fb_width != d.screen_width || fb_height != d.screen_height {
-                    d.screen_width = fb_width;
-                    d.screen_height = fb_height;
-                    return true;
-                }
-
-                // Check for position changes
-                if (rect.left as u32, rect.top as u32) != d.screen_position {
-                    d.screen_position = (rect.left as u32, rect.top as u32);
-                    return true;
-                }
-            } else {
-                // Handle error or default case
-                d.screen_width = 1;
-                d.screen_height = 1;
-            }
-        } else {
-            // Handle error or default case
-            d.screen_position = (0, 0);
+        let mut client: RECT = std::mem::zeroed();
+        if GetWindowRect(hwnd, &mut rect) == 0 || GetClientRect(hwnd, &mut client) == 0 {
+            return false;
         }
-
-        false
-    }
-
-    unsafe fn init_dpi(&mut self, high_dpi: bool) {
-        self.dpi_aware = high_dpi;
-        // get dpi scale factor for main monitor
-        if self.dpi_aware {
-            let pt = POINT { x: 1, y: 1 };
-            let hm = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
-            let mut dpix: UINT = 0;
-            let mut dpiy: UINT = 0;
-            let hr = GetDpiForMonitor(
-                hm,
-                MDT_EFFECTIVE_DPI,
-                &mut dpix as *mut _ as _,
-                &mut dpiy as *mut _ as _,
-            );
-            assert_eq!(hr, 0);
-            //  clamp window scale to an integer factor
-            self.window_scale = dpix as f32 / 96.0;
-        }
-        if high_dpi {
-            self.content_scale = self.window_scale;
-            self.mouse_scale = 1.0;
-        } else {
-            self.content_scale = 1.0;
-            self.mouse_scale = 1.0 / self.window_scale;
-        }
+        // Both native high-DPI rendering and the existing low-DPI mode use
+        // client-coordinate pixels. A logical round trip would discard pixels
+        // at fractional scales. Retain the existing nonzero minimized policy.
+        let width = (client.right - client.left).max(1);
+        let height = (client.bottom - client.top).max(1);
+        let position = (rect.left as u32, rect.top as u32);
+        let mut d = crate::native_display().lock().unwrap();
+        let changed =
+            (width, height) != (d.screen_width, d.screen_height) || position != d.screen_position;
+        d.screen_width = width;
+        d.screen_height = height;
+        d.screen_position = position;
+        changed
     }
 
     fn process_request(&mut self, request: Request) {
@@ -1299,16 +1282,9 @@ where
     F: 'static + FnOnce() -> Box<dyn EventHandler>,
 {
     unsafe {
-        if conf.high_dpi {
-            SetProcessDPIAware();
-        }
-        let (wnd, dc) = create_window(
-            &conf.window_title,
-            conf.fullscreen,
-            conf.window_resizable,
-            conf.window_width as _,
-            conf.window_height as _,
-        );
+        let dpi_api = dpi::DpiApi::load();
+        dpi_api.prepare_process(conf.high_dpi);
+        let (wnd, dc, window_dpi) = create_window(conf, &dpi_api);
         if let Some(icon) = &conf.icon {
             set_icon(wnd, icon);
         }
@@ -1317,14 +1293,16 @@ where
 
         let (msg_wnd, msg_dc) = create_msg_window();
         let mut display = WindowsDisplay {
-            fullscreen: false,
-            dpi_aware: false,
+            fullscreen: conf.fullscreen,
             window_resizable: conf.window_resizable,
             cursor_grabbed: false,
             iconified: false,
-            content_scale: 1.,
             mouse_scale: 1.,
-            window_scale: 1.,
+            window_scale: if conf.high_dpi {
+                window_dpi as f32 / dpi::BASE_DPI as f32
+            } else {
+                1.0
+            },
             mouse_x: 0.,
             mouse_y: 0.,
             show_cursor: true,
@@ -1339,7 +1317,6 @@ where
             modal_resizing_timer: 0,
             update_requested: true,
         };
-        display.init_dpi(conf.high_dpi);
 
         let (tx, rx) = std::sync::mpsc::channel();
         let clipboard = Box::new(clipboard::WindowsClipboard::new());
@@ -1364,6 +1341,9 @@ where
         // IMPORTANT: Show window AFTER WGL context is created
         // This ensures IME initializes correctly when window gains focus
         ShowWindow(wnd, SW_SHOW);
+        // ShowWindow can apply startup placement/minimization supplied by a host.
+        // Make the initial application callback observe the resulting client size.
+        display.update_dimensions(wnd);
 
         // Register for raw mouse input (needed for raw_mouse_motion event)
         let mut rawinputdevice: RAWINPUTDEVICE = std::mem::zeroed();
