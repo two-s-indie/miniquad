@@ -394,6 +394,12 @@ pub mod window {
     /// The position is in window client coordinates (pixels).
     /// This should be called when the text cursor moves to keep the IME
     /// candidate window near the insertion point.
+    ///
+    /// On Windows these are the same client-pixel units as `screen_size()` and
+    /// absolute mouse events. Convert a logical text-cursor position using the
+    /// current `dpi_scale()` once, rounding to the nearest pixel. Resubmit it
+    /// after DPI or layout changes; the backend retains the pixel anchor during
+    /// composition startup but does not rescale an existing request.
     pub fn set_ime_position(x: i32, y: i32) {
         let d = native_display().lock().unwrap();
         #[cfg(target_os = "android")]

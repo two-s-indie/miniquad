@@ -345,6 +345,137 @@ unrelated compiler and incremental-cache warnings remain.
 These tests use real windows but injected DPI messages. They do not replace the
 physical-monitor and interactive integration checks below.
 
+## Step 5: Macroquad integration (2026-11-01)
+
+The paired Macroquad branch now rounds Windows runtime size requests to the
+nearest framebuffer pixel. Previously an 801 x 601 request at 175% truncated to
+1401 x 1051, although startup produced 1402 x 1052. The integration audit also
+found Windows button events using the previous mouse position and composition
+startup overwriting an explicit IME anchor. Button events now use their own
+signed client coordinates; IME startup retains the requested pixel anchor.
+Releasing a cursor grab refreshes absolute mouse coordinates without waiting
+for pointer movement. Failed/empty clip-rectangle queries are ignored.
+
+### Coordinate contract
+
+These Windows rules apply to the paired fork branches:
+
+| API / value | Units and behavior |
+| --- | --- |
+| Miniquad `Conf.window_width`, `window_height` | Logical client dimensions for normal high-DPI startup; multiplied by the actual window's rendering scale and rounded once. |
+| Miniquad `window::screen_size()` | Actual client/framebuffer pixels, subject to the documented nonzero minimized policy. |
+| Miniquad `window::dpi_scale()` / Macroquad `screen_dpi_scale()` | Current rendering scale, published before resize callbacks or drawing. |
+| Miniquad `window::set_window_size()` on Windows | Client/framebuffer pixels, already scaled by the caller. No additional DPI multiplication. |
+| Macroquad `screen_width()`, `screen_height()` | Actual framebuffer divided by current scale. Fractional logical dimensions are expected after pixel rounding. |
+| Macroquad `request_new_screen_size()` on Windows | Logical client dimensions, multiplied by current scale and rounded once; the result arrives asynchronously and remains subject to OS constraints. |
+| Miniquad absolute mouse events | Signed client pixels, matching the framebuffer coordinate system. |
+| Macroquad `mouse_position()` | Logical client coordinates, matching drawing and hit testing. While grabbed, the cache integrates raw relative motion and describes a virtual position. |
+| Miniquad raw relative mouse events | Hardware motion units; the DPI transition does not rescale them. |
+| Windows cursor clipping | Client-pixel corners converted to signed screen coordinates. Updated after geometry/DPI changes. |
+| Miniquad `window::set_ime_position()` on Windows | Client pixels for composition/candidate placement; callers resubmit after DPI or layout changes. |
+
+For 801 x 601 logical units, startup and a fresh Macroquad runtime request produce:
+
+| Scale | Framebuffer pixels | Reported logical size (approximately) |
+| --- | --- | --- |
+| 1 | 801 x 601 | 801 x 601 |
+| 1.25 | 1001 x 751 | 800.8 x 600.8 |
+| 1.5 | 1202 x 902 | 801.3333 x 601.3333 |
+| 1.75 | 1402 x 1052 | 801.1429 x 601.1429 |
+| 2 | 1602 x 1202 | 801 x 601 |
+
+Positive half pixels round upward. Each boundary can differ from the requested
+logical size by at most half a physical pixel before OS constraints. Startup
+retains the original logical intent; runtime Miniquad requests can retain only
+the submitted integer pixels divided by the scale at request time. Subsequent
+DPI transitions preserve that intent without repeatedly feeding rounded results
+back into it. Applications should lay out against the reported screen size.
+
+Macroquad already rasterizes and caches text at a DPI-dependent font size and
+converts glyph geometry back to logical units. No text-renderer change was
+needed. For an IME anchor supplied from Macroquad, convert once:
+
+```rust
+let scale = macroquad::window::screen_dpi_scale();
+macroquad::window::miniquad::window::set_ime_position(
+    (logical_cursor_x * scale).round() as i32,
+    (logical_cursor_y * scale).round() as i32,
+);
+```
+
+The IME may adjust its popup placement; the tests inspect the requested IMM
+forms, not the final visible popup. See Microsoft's
+[composition form](https://learn.microsoft.com/en-us/windows/win32/api/imm/ns-imm-compositionform),
+[candidate form](https://learn.microsoft.com/en-us/windows/win32/api/imm/ns-imm-candidateform),
+and [cursor clip coordinate contract](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-clipcursor).
+
+### Awareness and compatibility limits
+
+The executable's existing awareness remains authoritative. An explicitly unaware
+window reports scale 1 through `GetDpiForWindow`; a system-aware window uses the
+system DPI rather than tracking each monitor. Windows can virtualize or stretch
+those windows. These fallback modes cannot promise native sharpness or per-monitor
+transitions. Older API fallbacks are covered by unit tests, not older-OS hardware.
+`high_dpi: false` keeps rendering scale 1 and unscaled client sizes even in a
+PerMonitorV2 host; it does not introduce a low-resolution offscreen buffer.
+
+The startup logical-size change is intentional compatibility behavior. Other
+backends keep their existing native sizing contracts; the Macroquad rounding
+change is Windows-only. Fullscreen entry still selects the primary monitor, the
+public position API still uses `u32`, and no monitor-selection API was added.
+Game Git dependency revisions remain unchanged until these branches are adopted.
+
+### Integration evidence
+
+The opt-in Macroquad `windows_dpi_integration` test creates real HWND/WGL windows
+and exercises the public Macroquad API in four isolated processes: high/low DPI,
+each with normal/blocking loops under PerMonitorV2 awareness. It checks GPU
+readback for text and a centered hit-test rectangle, matches text measurements
+to drawing, checks actual client dimensions independently, and tests even/odd
+runtime size requests. Clicks are sent without preceding motion; release events
+include negative coordinates. DPI awaits have no test polling timer or explicit
+frame request. Explicit test commands and native monitor moves do request a frame.
+
+Real native window moves were exercised between these connected displays:
+
+| Display bounds in screen pixels | Native DPI | High-DPI client (801 x 601 intent) | Low-DPI client |
+| --- | --- | --- | --- |
+| (0, 0) to (3840, 2160) | 168 / 175% | 1402 x 1052 | 801 x 601 |
+| (-2560, 720) to (0, 2160) | 96 / 100% | 801 x 601 | 801 x 601 |
+
+The test moves out and back using native `SetWindowPos`; these DPI messages are
+generated by Windows. Separate injected transitions cover 100%, 125%, 150%,
+175%, 200%, 175%, and 100% without changing desktop settings. Cursor clipping is
+queried at 125%, 200%, and 175%, followed by stationary-pointer verification on
+release. IMM composition/candidate anchor queries pass at every injected scale,
+including composition startup (seven checks in each of the four modes).
+
+GPU readbacks at 125% and 175% were visually inspected: text is visible at the
+appropriate pixel size and the hit-test rectangle is centered and green. The
+default font's measured `MMMM` remains 56 x 16 logical units across the tested
+scales. This is evidence for the default-font path, not every font or script.
+
+To repeat from `../macroquad` (Windows 10 1703+, an interactive desktop, OpenGL,
+and IMM support required):
+
+```powershell
+cargo tree --config 'patch.crates-io.miniquad.path="../miniquad"' -i miniquad
+cargo test --test windows_dpi_integration --config 'patch.crates-io.miniquad.path="../miniquad"' -- --ignored --nocapture --test-threads=1
+```
+
+The test is ignored by default because it requires this paired Miniquad fork and
+an interactive desktop. It briefly clips the cursor and restores the original
+cursor position/clip afterward. Set `MACROQUAD_DPI_ARTIFACTS` to a directory to
+retain framebuffer PNGs. Local results for this run are under
+`target/dpi-validation/macroquad-step5-test.log` and `macroquad-step5-images/`
+(not versioned).
+
+The full Miniquad Windows all-target test suite passed, as did its Rust 1.70
+library check and all-target Linux/Wasm checks. Macroquad's library, DPI example,
+and integration-test target also passed Linux/Wasm compilation with the local
+Miniquad override. Existing unrelated compiler and incremental-cache warnings
+remain. Formatting and whitespace checks passed for the changed Rust files.
+
 ## Remaining physical-monitor checks
 
 Record actual display scales, awareness mode, requested size, native client
@@ -353,8 +484,8 @@ Keep baseline observations separate from results after implementing the fix.
 
 - Compare the SDL diagnostic on the same displays and retain its measurements.
 - Check 100%, 125%, 150%, 175%, and 200% startup where displays are available.
-- Move between differently scaled monitors, including negative desktop positions.
-- Repeat round trips with 801 x 601 logical intent and verify no accumulated drift.
+- Physically drag between differently scaled monitors, including negative desktop
+  positions, and repeat round trips with 801 x 601 intent to check for drift.
 - Check runtime R/O requests for double scaling and pixel rounding.
 - Test stationary-mouse and blocking-mode DPI changes without pressing P to wake
   the application; the visible frame counter/indicator must change on its own.
@@ -364,7 +495,9 @@ Keep baseline observations separate from results after implementing the fix.
 - Check cursor clipping, cached mouse coordinates, and IME placement. Use the
   existing `ime_test` example for IME behavior; this diagnostic has no text input.
 
-These physical-monitor checks remain unverified. Passing startup, injected DPI
-message tests, and builds does not verify Windows' actual monitor selection,
-message ordering during a physical drag, or display-settings changes. Visual
-text/hit-test accuracy, cursor grabbing and IME still need interactive validation.
+Step 5 verifies native moves between the actual 100% and 175% displays, GPU text
+and hit testing, cursor clip rectangles, and IMM anchor coordinates. The broader
+interactive matrix above remains open: physical dragging, display-settings
+changes, other real scale combinations, visible IME composition/candidate popups,
+and SDL comparison measurements. Automated window moves and injected messages
+do not establish those results.

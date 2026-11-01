@@ -123,7 +123,7 @@ pub(crate) struct WindowsDisplay {
     notified_size: Option<(i32, i32)>,
     initializing: bool,
     window_destroyed: bool,
-    dpi_changed: bool,
+    mouse_position_dirty: bool,
     pending_dpi: Option<(u32, RECT)>,
     events: events::PendingEvents,
     mouse_scale: f32,
@@ -131,6 +131,7 @@ pub(crate) struct WindowsDisplay {
     user_cursor: bool,
     mouse_x: f32,
     mouse_y: f32,
+    ime_position: Option<POINT>,
     cursor: HCURSOR,
     libopengl32: LibOpengl32,
     _msg_wnd: HWND,
@@ -145,6 +146,12 @@ pub(crate) struct WindowsDisplay {
 
 impl WindowsDisplay {
     unsafe fn set_cursor_grab(this: *mut Self, grab: bool) {
+        if (*this).cursor_grabbed && !grab {
+            // Downstream clients may have accumulated virtual raw motion while
+            // grabbed. Restore absolute client coordinates even without motion.
+            (*this).mouse_position_dirty = true;
+            (*this).update_requested = true;
+        }
         (*this).cursor_grabbed = grab;
         unsafe {
             if grab {
@@ -162,6 +169,9 @@ impl WindowsDisplay {
     }
     /// Set IME candidate window position in client coordinates
     unsafe fn set_ime_position(this: *mut Self, x: i32, y: i32) {
+        // Retain the caller's client-pixel anchor even if the IME context is
+        // currently unavailable. Composition startup must not replace it.
+        (*this).ime_position = Some(POINT { x, y });
         unsafe {
             let himc = ImmGetContext((*this).wnd);
             if himc.is_null() {
@@ -243,11 +253,12 @@ fn get_win_style(is_fullscreen: bool, is_resizable: bool) -> DWORD {
 }
 
 unsafe fn update_clip_rect(hwnd: HWND) {
-    // Retrieve the screen coordinates of the client area,
-    // and convert them into client coordinates.
+    // ClipCursor expects screen coordinates; convert both client-pixel corners.
     let mut rect: RECT = std::mem::zeroed();
 
-    GetClientRect(hwnd, &mut rect as *mut _ as _);
+    if GetClientRect(hwnd, &mut rect) == 0 || rect.right <= rect.left || rect.bottom <= rect.top {
+        return;
+    }
     let mut upper_left = POINT {
         x: rect.left,
         y: rect.top,
@@ -257,8 +268,9 @@ unsafe fn update_clip_rect(hwnd: HWND) {
         y: rect.bottom,
     };
 
-    ClientToScreen(hwnd, &mut upper_left as *mut _ as _);
-    ClientToScreen(hwnd, &mut lower_right as *mut _ as _);
+    if ClientToScreen(hwnd, &mut upper_left) == 0 || ClientToScreen(hwnd, &mut lower_right) == 0 {
+        return;
+    }
 
     SetRect(
         &mut rect as *mut _ as _,
@@ -522,52 +534,24 @@ unsafe fn window_message(
                 return 1;
             }
         }
-        WM_LBUTTONDOWN => {
-            let mouse_x = (*payload).mouse_x;
-            let mouse_y = (*payload).mouse_y;
-            (*payload)
-                .events
-                .mouse_button_down_event(MouseButton::Left, mouse_x, mouse_y);
-        }
-        WM_RBUTTONDOWN => {
-            let mouse_x = (*payload).mouse_x;
-            let mouse_y = (*payload).mouse_y;
-
-            (*payload)
-                .events
-                .mouse_button_down_event(MouseButton::Right, mouse_x, mouse_y);
-        }
-        WM_MBUTTONDOWN => {
-            let mouse_x = (*payload).mouse_x;
-            let mouse_y = (*payload).mouse_y;
-
-            (*payload)
-                .events
-                .mouse_button_down_event(MouseButton::Middle, mouse_x, mouse_y);
-        }
-        WM_LBUTTONUP => {
-            let mouse_x = (*payload).mouse_x;
-            let mouse_y = (*payload).mouse_y;
-
-            (*payload)
-                .events
-                .mouse_button_up_event(MouseButton::Left, mouse_x, mouse_y);
-        }
-        WM_RBUTTONUP => {
-            let mouse_x = (*payload).mouse_x;
-            let mouse_y = (*payload).mouse_y;
-
-            (*payload)
-                .events
-                .mouse_button_up_event(MouseButton::Right, mouse_x, mouse_y);
-        }
-        WM_MBUTTONUP => {
-            let mouse_x = (*payload).mouse_x;
-            let mouse_y = (*payload).mouse_y;
-
-            (*payload)
-                .events
-                .mouse_button_up_event(MouseButton::Middle, mouse_x, mouse_y);
+        WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN | WM_LBUTTONUP | WM_RBUTTONUP
+        | WM_MBUTTONUP => {
+            // Button messages carry their own signed client coordinates. A
+            // preceding WM_MOUSEMOVE is not guaranteed after geometry changes.
+            let x = GET_X_LPARAM(lparam) as f32 * (*payload).mouse_scale;
+            let y = GET_Y_LPARAM(lparam) as f32 * (*payload).mouse_scale;
+            (*payload).mouse_x = x;
+            (*payload).mouse_y = y;
+            let button = match umsg {
+                WM_LBUTTONDOWN | WM_LBUTTONUP => MouseButton::Left,
+                WM_RBUTTONDOWN | WM_RBUTTONUP => MouseButton::Right,
+                _ => MouseButton::Middle,
+            };
+            if matches!(umsg, WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN) {
+                (*payload).events.mouse_button_down_event(button, x, y);
+            } else {
+                (*payload).events.mouse_button_up_event(button, x, y);
+            }
         }
 
         WM_MOUSEMOVE => {
@@ -717,6 +701,10 @@ unsafe fn window_message(
             return DefWindowProcW(hwnd, umsg, wparam, lparam);
         }
         WM_IME_STARTCOMPOSITION => {
+            if let Some(position) = (*payload).ime_position {
+                WindowsDisplay::set_ime_position(payload, position.x, position.y);
+                return DefWindowProcW(hwnd, umsg, wparam, lparam);
+            }
             // Offset for candidate window below composition position
             const CANDIDATE_WINDOW_Y_OFFSET: i32 = 20;
 
@@ -1197,7 +1185,7 @@ where
             notified_size: None,
             initializing: true,
             window_destroyed: false,
-            dpi_changed: false,
+            mouse_position_dirty: false,
             pending_dpi: None,
             events: Default::default(),
             mouse_scale: 1.,
@@ -1208,6 +1196,7 @@ where
             },
             mouse_x: 0.,
             mouse_y: 0.,
+            ime_position: None,
             show_cursor: true,
             user_cursor: false,
             cursor: std::ptr::null_mut(),

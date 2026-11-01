@@ -104,7 +104,7 @@ impl WindowsDisplay {
     unsafe fn apply_dpi(this: *mut Self, dpi: u32, suggested: RECT) {
         (*this).geometry_depth += 1;
         (*this).window_dpi = dpi;
-        (*this).dpi_changed = true;
+        (*this).mouse_position_dirty = true;
         (*this).update_requested = true;
         let hwnd = (*this).wnd;
         if Self::is_normal(this) {
@@ -200,12 +200,13 @@ impl WindowsDisplay {
             // returning to the loop. Wake ordinary native resizes too, not only DPI.
             PostMessageW(hwnd, WM_NULL, 0, 0);
         }
-        if std::mem::replace(&mut (*this).dpi_changed, false) && !(*this).cursor_grabbed {
+        if (*this).mouse_position_dirty && !(*this).cursor_grabbed {
             // A stationary pointer may have different client coordinates after
             // the transition. Refresh downstream caches without touching raw
             // relative hardware units or moving the OS cursor.
             let mut point: POINT = std::mem::zeroed();
             if GetCursorPos(&mut point) != 0 && ScreenToClient(hwnd, &mut point) != 0 {
+                (*this).mouse_position_dirty = false;
                 (*this).mouse_x = point.x as f32;
                 (*this).mouse_y = point.y as f32;
                 (*this)
