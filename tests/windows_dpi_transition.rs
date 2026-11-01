@@ -4,9 +4,47 @@
 //! exercise engine transitions, not Windows' monitor selection or DPI delivery.
 use miniquad::{conf::Conf, window, EventHandler};
 use std::{
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, AtomicIsize, AtomicUsize, Ordering},
+        Arc, Mutex,
+    },
     time::{Duration, Instant},
 };
+
+static ORIGINAL_WNDPROC: AtomicIsize = AtomicIsize::new(0);
+static MODAL_TIMER: AtomicUsize = AtomicUsize::new(0);
+static IN_TIMER: AtomicBool = AtomicBool::new(false);
+static EMPTY_CLIENT: AtomicBool = AtomicBool::new(false);
+
+unsafe extern "system" fn probe_wndproc(hwnd: HWND, msg: u32, wp: usize, lp: isize) -> isize {
+    let timer = msg == WM_TIMER;
+    if timer {
+        MODAL_TIMER.store(wp, Ordering::SeqCst);
+        IN_TIMER.store(true, Ordering::SeqCst);
+    }
+    let result = CallWindowProcW(
+        std::mem::transmute(ORIGINAL_WNDPROC.load(Ordering::SeqCst)),
+        hwnd,
+        msg,
+        wp,
+        lp,
+    );
+    if msg == WM_NCCALCSIZE && EMPTY_CLIENT.load(Ordering::SeqCst) {
+        // Produce an actual empty normal client area through the documented
+        // non-client calculation hook, rather than mocking our own geometry code.
+        let rect = if wp != 0 {
+            &mut (*(lp as *mut NCCALCSIZE_PARAMS)).rgrc[0]
+        } else {
+            &mut *(lp as *mut RECT)
+        };
+        rect.right = rect.left;
+        rect.bottom = rect.top;
+    }
+    if timer {
+        IN_TIMER.store(false, Ordering::SeqCst);
+    }
+    result
+}
 use winapi::{
     shared::{minwindef::BOOL, windef::*},
     um::{
@@ -25,6 +63,10 @@ struct Observed {
     mouse: (f32, f32),
     resize_scale: f32,
     reenter_dpi: Option<u32>,
+    timer_frames: usize,
+    quits: usize,
+    quit_finished: bool,
+    keys: usize,
 }
 
 struct App {
@@ -33,6 +75,10 @@ struct App {
 }
 impl App {
     fn check(&self) {
+        assert!(
+            !self.observed.lock().unwrap().quit_finished,
+            "callback after accepted quit"
+        );
         unsafe {
             let mut client: RECT = std::mem::zeroed();
             assert_ne!(GetClientRect(self.hwnd, &mut client), 0);
@@ -43,6 +89,12 @@ impl App {
                     (client.bottom - client.top).max(1) as f32,
                 ),
                 "callback observed stale framebuffer dimensions"
+            );
+            let rect = outer(self.hwnd);
+            assert_eq!(
+                window::get_window_position(),
+                (rect.left as u32, rect.top as u32),
+                "callback observed a different position snapshot"
             );
         }
     }
@@ -55,6 +107,9 @@ impl EventHandler for App {
         self.check();
         let mut o = self.observed.lock().unwrap();
         o.frames += 1;
+        if IN_TIMER.load(Ordering::SeqCst) {
+            o.timer_frames += 1;
+        }
         o.scale = window::dpi_scale();
         o.size = window::screen_size();
     }
@@ -88,6 +143,20 @@ impl EventHandler for App {
     }
     fn window_restored_event(&mut self) {
         self.check();
+    }
+    fn quit_requested_event(&mut self) {
+        self.check();
+        let mut o = self.observed.lock().unwrap();
+        o.quits += 1;
+        if o.quits == 1 {
+            window::cancel_quit();
+        } else {
+            o.quit_finished = true;
+        }
+    }
+    fn key_down_event(&mut self, _: miniquad::KeyCode, _: miniquad::KeyMods, _: bool) {
+        self.check();
+        self.observed.lock().unwrap().keys += 1;
     }
 }
 
@@ -137,6 +206,75 @@ fn pixels(size: (u32, u32), dpi: u32, base: u32) -> (f32, f32) {
 
 unsafe fn exercise(hwnd: HWND, observed: Arc<Mutex<Observed>>, low: bool) {
     wait_for(&observed, "initial frame", |o| o.frames > 0);
+    // A move alone updates position without causing resize callbacks. A duplicate
+    // WM_SIZE contains only 16-bit dimensions, so it must never replace the HWND
+    // query with its deliberately misleading payload.
+    let before = *observed.lock().unwrap();
+    SetWindowPos(
+        hwnd,
+        std::ptr::null_mut(),
+        -41,
+        -23,
+        0,
+        0,
+        SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+    );
+    SendMessageW(hwnd, WM_SIZE, SIZE_RESTORED, 7 | (9 << 16));
+    assert_eq!(
+        window::get_window_position(),
+        (-41i32 as u32, -23i32 as u32)
+    );
+    assert_eq!(observed.lock().unwrap().resizes, before.resizes);
+    assert_eq!(window::screen_size(), before.size);
+    let rect = outer(hwnd);
+    EMPTY_CLIENT.store(true, Ordering::SeqCst);
+    SetWindowPos(
+        hwnd,
+        std::ptr::null_mut(),
+        0,
+        0,
+        rect.right - rect.left + 1,
+        rect.bottom - rect.top + 1,
+        SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+    );
+    let mut client: RECT = std::mem::zeroed();
+    assert_ne!(GetClientRect(hwnd, &mut client), 0);
+    assert_eq!((client.right, client.bottom), (0, 0));
+    let suspended = *observed.lock().unwrap();
+    SendMessageW(hwnd, WM_KEYDOWN, VK_F24 as _, 0);
+    std::thread::sleep(Duration::from_millis(30));
+    assert_eq!(
+        observed.lock().unwrap().frames,
+        suspended.frames,
+        "drew with invalid normal geometry"
+    );
+    assert_eq!(
+        observed.lock().unwrap().keys,
+        suspended.keys,
+        "delivered input with invalid geometry"
+    );
+    assert_eq!(
+        window::screen_size(),
+        before.size,
+        "published a fabricated empty-client resize"
+    );
+    EMPTY_CLIENT.store(false, Ordering::SeqCst);
+    SetWindowPos(
+        hwnd,
+        std::ptr::null_mut(),
+        0,
+        0,
+        rect.right - rect.left,
+        rect.bottom - rect.top,
+        SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+    );
+    let recovered = wait_for(&observed, "geometry recovery and queued input", |o| {
+        o.frames > suspended.frames && o.keys == suspended.keys + 1
+    });
+    assert_eq!(
+        recovered.resizes, before.resizes,
+        "invalid intermediate rectangle generated resize callbacks"
+    );
     // Start each normal transition at the same signed desktop position, safely
     // overlapping the primary monitor even when its top-left corner is negative.
     let mut suggested = outer(hwnd);
@@ -227,6 +365,7 @@ unsafe fn exercise(hwnd: HWND, observed: Arc<Mutex<Observed>>, low: bool) {
     let mut client: RECT = std::mem::zeroed();
     GetClientRect(hwnd, &mut client);
     let rect = outer(hwnd);
+    let before = *observed.lock().unwrap();
     SetWindowPos(
         hwnd,
         std::ptr::null_mut(),
@@ -236,8 +375,15 @@ unsafe fn exercise(hwnd: HWND, observed: Arc<Mutex<Observed>>, low: bool) {
         731 + rect.bottom - rect.top - client.bottom,
         SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
     );
-    PostMessageW(hwnd, WM_NULL, 0, 0);
-    wait_for(&observed, "native resize", |o| o.size == (987.0, 731.0));
+    // No posted wake-up and no mouse/input: the resize itself must wake GetMessage.
+    let after = wait_for(&observed, "native resize and redraw", |o| {
+        o.size == (987.0, 731.0) && o.frames > before.frames
+    });
+    assert_eq!(
+        after.resizes,
+        before.resizes + 1,
+        "native resize was reported more than once"
+    );
     change(hwnd, 120, suggested);
     wait_for(&observed, "native intent at 125%", |o| {
         o.size == expected((987, 731), 120, 168)
@@ -281,13 +427,31 @@ unsafe fn exercise(hwnd: HWND, observed: Arc<Mutex<Observed>>, low: bool) {
 
     // The modal timer must use the same publish/notify path as the normal loop.
     SendMessageW(hwnd, WM_ENTERSIZEMOVE, 0, 0);
+    SendMessageW(hwnd, WM_ENTERMENULOOP, 0, 0);
     let before = *observed.lock().unwrap();
     change(hwnd, 168, suggested);
     let after = wait_for(&observed, "modal DPI redraw", |o| {
         o.frames > before.frames && o.size == (987.0, 731.0)
     });
     assert!(after.resizes - before.resizes <= 1);
+    wait_for(&observed, "modal timer frame", |o| o.timer_frames > 0);
+    let timer = MODAL_TIMER.load(Ordering::SeqCst);
+    assert_ne!(timer, 0);
+    SendMessageW(hwnd, WM_EXITMENULOOP, 0, 0);
+    let before = *observed.lock().unwrap();
+    wait_for(&observed, "outer modal loop still draws", |o| {
+        o.timer_frames > before.timer_frames
+    });
     SendMessageW(hwnd, WM_EXITSIZEMOVE, 0, 0);
+    let before = *observed.lock().unwrap();
+    // KillTimer doesn't remove already-queued messages; replay one explicitly.
+    SendMessageW(hwnd, WM_TIMER, timer, 0);
+    SendMessageW(hwnd, WM_TIMER, 0, 0);
+    assert_eq!(
+        observed.lock().unwrap().timer_frames,
+        before.timer_frames,
+        "stale modal timer drew after exiting the loop"
+    );
 
     window::set_fullscreen(true);
     PostMessageW(hwnd, WM_NULL, 0, 0);
@@ -315,7 +479,11 @@ unsafe fn exercise(hwnd: HWND, observed: Arc<Mutex<Observed>>, low: bool) {
         "resize, scale-only, minimize/maximize, modal, fullscreen: {:?}",
         *observed.lock().unwrap()
     );
-    PostMessageW(hwnd, WM_CLOSE, 0, 0);
+    SendMessageW(hwnd, WM_CLOSE, 0, 0);
+    assert_eq!(observed.lock().unwrap().quits, 1);
+    assert!(!observed.lock().unwrap().quit_finished);
+    SendMessageW(hwnd, WM_CLOSE, 0, 0);
+    assert!(observed.lock().unwrap().quit_finished);
 }
 
 #[test]
@@ -383,6 +551,22 @@ fn dpi_transitions() {
     miniquad::start(conf, move || unsafe {
         let hwnd = FindWindowW(std::ptr::null(), title.as_ptr());
         assert!(!hwnd.is_null());
+        #[cfg(target_pointer_width = "64")]
+        let original = SetWindowLongPtrW(hwnd, GWLP_WNDPROC, probe_wndproc as *const () as isize);
+        #[cfg(target_pointer_width = "32")]
+        let original =
+            SetWindowLongW(hwnd, GWLP_WNDPROC, probe_wndproc as *const () as i32) as isize;
+        assert_ne!(original, 0);
+        ORIGINAL_WNDPROC.store(original, Ordering::SeqCst);
+        // Native messages can arrive while the application factory is running,
+        // before it returns an event handler. Keep public geometry current then.
+        change(hwnd, 120, outer(hwnd));
+        change(hwnd, 144, outer(hwnd));
+        assert_eq!(window::dpi_scale(), if low { 1.0 } else { 1.5 });
+        assert_eq!(
+            window::screen_size(),
+            if low { (801.0, 601.0) } else { (1202.0, 902.0) }
+        );
         let address = hwnd as usize;
         let observations = observed.clone();
         *driver.lock().unwrap() = Some(std::thread::spawn(move || {

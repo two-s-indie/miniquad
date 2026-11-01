@@ -117,6 +117,12 @@ pub(crate) struct WindowsDisplay {
     restore_size_pending: bool,
     windowed_placement: Option<WINDOWPLACEMENT>,
     geometry_depth: usize,
+    notification_depth: usize,
+    geometry: Option<geometry::Geometry>,
+    geometry_suspended: bool,
+    notified_size: Option<(i32, i32)>,
+    initializing: bool,
+    window_destroyed: bool,
     dpi_changed: bool,
     pending_dpi: Option<(u32, RECT)>,
     events: events::PendingEvents,
@@ -133,6 +139,7 @@ pub(crate) struct WindowsDisplay {
     dc: HDC,
     event_handler: Option<Box<dyn EventHandler>>,
     modal_resizing_timer: usize,
+    modal_loop_depth: usize,
     update_requested: bool,
 }
 
@@ -419,24 +426,39 @@ unsafe extern "system" fn win32_wndproc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
-    let display_ptr: isize;
-
     #[cfg(target_pointer_width = "64")]
-    {
-        display_ptr = GetWindowLongPtrA(hwnd, GWLP_USERDATA)
-    }
-
+    let display_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA);
     #[cfg(target_pointer_width = "32")]
-    {
-        display_ptr = GetWindowLong(hwnd, GWLP_USERDATA)
-    }
+    let display_ptr = GetWindowLongW(hwnd, GWLP_USERDATA) as isize;
 
     if display_ptr == 0 {
         return DefWindowProcW(hwnd, umsg, wparam, lparam);
     }
     let payload = display_ptr as *mut WindowsDisplay;
+    if umsg == WM_NCDESTROY {
+        WindowsDisplay::detach(payload);
+        (*payload).window_destroyed = true;
+        crate::native_display().lock().unwrap().quit_ordered = true;
+        PostQuitMessage(0);
+        return DefWindowProcW(hwnd, umsg, wparam, lparam);
+    }
+    // DefWindowProc(WM_WINDOWPOSCHANGED) nests WM_SIZE/WM_MOVE. Deliver their
+    // callbacks together after it finishes, not during non-client calculation.
+    let preparing_geometry = matches!(
+        umsg,
+        WM_WINDOWPOSCHANGING | WM_NCCALCSIZE | WM_GETMINMAXINFO
+    );
+    let geometry_message = preparing_geometry || umsg == WM_WINDOWPOSCHANGED;
+    if geometry_message {
+        (*payload).notification_depth += 1;
+    }
     let result = window_message(payload, hwnd, umsg, wparam, lparam);
-    WindowsDisplay::flush_events(payload);
+    if geometry_message {
+        (*payload).notification_depth -= 1;
+    }
+    if !preparing_geometry {
+        WindowsDisplay::flush_events(payload);
+    }
     result
 }
 
@@ -781,23 +803,29 @@ unsafe fn window_message(
             return DefWindowProcW(hwnd, umsg, wparam, lparam);
         }
         WM_ENTERSIZEMOVE | WM_ENTERMENULOOP => {
-            SetTimer(
-                hwnd,
-                std::ptr::addr_of!((*payload).modal_resizing_timer) as usize,
-                10,
-                None,
-            );
+            if (*payload).modal_loop_depth == 0 {
+                (*payload).modal_resizing_timer = SetTimer(
+                    hwnd,
+                    std::ptr::addr_of!((*payload).modal_resizing_timer) as usize,
+                    10,
+                    None,
+                );
+            }
+            (*payload).modal_loop_depth += 1;
         }
         WM_TIMER => {
-            if wparam == std::ptr::addr_of!((*payload).modal_resizing_timer) as usize {
+            if (*payload).modal_loop_depth != 0
+                && wparam == (*payload).modal_resizing_timer
+                && wparam != 0
+            {
                 WindowsDisplay::frame(payload, true);
             }
         }
         WM_EXITSIZEMOVE | WM_EXITMENULOOP => {
-            KillTimer(
-                hwnd,
-                std::ptr::addr_of!((*payload).modal_resizing_timer) as usize,
-            );
+            (*payload).modal_loop_depth = (*payload).modal_loop_depth.saturating_sub(1);
+            if (*payload).modal_loop_depth == 0 {
+                WindowsDisplay::stop_modal_timer(payload);
+            }
         }
         WM_DROPFILES => {
             let hdrop = wparam as HDROP;
@@ -1163,6 +1191,12 @@ where
             restore_size_pending: false,
             windowed_placement: None,
             geometry_depth: 0,
+            notification_depth: 0,
+            geometry: None,
+            geometry_suspended: false,
+            notified_size: None,
+            initializing: true,
+            window_destroyed: false,
             dpi_changed: false,
             pending_dpi: None,
             events: Default::default(),
@@ -1184,6 +1218,7 @@ where
             dc,
             event_handler: None,
             modal_resizing_timer: 0,
+            modal_loop_depth: 0,
             update_requested: true,
         };
 
@@ -1207,17 +1242,32 @@ where
 
         super::gl::load_gl_funcs(|proc| display.get_proc_address(proc));
 
+        // Install the stable payload once shared state and WGL exist, before
+        // showing the window or running user initialization (both may send DPI
+        // and geometry messages). No handler is borrowed across either call.
+        let display = &mut display as *mut WindowsDisplay;
+        #[cfg(target_pointer_width = "64")]
+        SetWindowLongPtrW(wnd, GWLP_USERDATA, display as isize);
+        #[cfg(target_pointer_width = "32")]
+        SetWindowLongW(wnd, GWLP_USERDATA, display as isize);
+
         // IMPORTANT: Show window AFTER WGL context is created
         // This ensures IME initializes correctly when window gains focus
+        // Showing/host startup placement is not an intentional user resize;
+        // do not replace logical intent with the rounded startup pixels.
+        (*display).geometry_depth += 1;
         ShowWindow(wnd, SW_SHOW);
+        (*display).geometry_depth -= 1;
         // ShowWindow can apply startup placement/minimization supplied by a host.
         // Make the initial application callback observe the resulting client size.
-        WindowsDisplay::publish_geometry(&mut display);
+        WindowsDisplay::flush_events(display);
+        (*display).notified_size = (*display).geometry.map(|geometry| geometry.size);
 
         // Register for raw mouse input (needed for raw_mouse_motion event)
         let mut client: RECT = std::mem::zeroed();
         if GetClientRect(wnd, &mut client) != 0 {
-            display.normal_client_size = (client.right - client.left, client.bottom - client.top);
+            (*display).normal_client_size =
+                (client.right - client.left, client.bottom - client.top);
         }
         let mut rawinputdevice: RAWINPUTDEVICE = std::mem::zeroed();
         rawinputdevice.usUsagePage = HID_USAGE_PAGE_GENERIC;
@@ -1233,14 +1283,10 @@ where
             "Win32: failed to register for raw mouse input!"
         );
 
-        display.event_handler = Some(f());
-
-        let display = &mut display as *mut WindowsDisplay;
-
-        #[cfg(target_arch = "x86_64")]
-        SetWindowLongPtrA(wnd, GWLP_USERDATA, display as isize);
-        #[cfg(target_arch = "x86")]
-        SetWindowLong(wnd, GWLP_USERDATA, display as isize);
+        let handler = f();
+        (*display).event_handler = Some(handler);
+        (*display).initializing = false;
+        WindowsDisplay::flush_events(display);
 
         let mut done = false;
         while !(done || crate::native_display().lock().unwrap().quit_ordered) {
@@ -1248,32 +1294,55 @@ where
                 WindowsDisplay::process_request(display, request);
             }
 
-            let mut dispatch_message = |mut msg: MSG| {
-                if msg.message == WM_QUIT {
-                    done = true;
-                } else {
-                    TranslateMessage(&mut msg as *mut _ as _);
-                    DispatchMessageW(&mut msg as *mut _ as _);
-                }
-            };
+            if crate::native_display().lock().unwrap().quit_ordered {
+                break;
+            }
             let mut msg: MSG = std::mem::zeroed();
             let block_on_wait = conf.platform.blocking_event_loop && !(*display).update_requested;
             if block_on_wait {
-                GetMessageW(&mut msg as *mut _ as _, NULL as _, 0, 0);
-                dispatch_message(msg);
+                let result = GetMessageW(&mut msg, NULL as _, 0, 0);
+                if result <= 0 {
+                    if result == -1 {
+                        eprintln!(
+                            "Win32 GetMessage failed: {}",
+                            std::io::Error::last_os_error()
+                        );
+                    }
+                    break;
+                }
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
             } else {
                 while PeekMessageW(&mut msg as *mut _ as _, NULL as _, 0, 0, PM_REMOVE) != 0 {
-                    dispatch_message(msg);
+                    if msg.message == WM_QUIT {
+                        done = true;
+                        break;
+                    }
+                    TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                    if crate::native_display().lock().unwrap().quit_ordered {
+                        break;
+                    }
                 }
             }
 
+            if done || crate::native_display().lock().unwrap().quit_ordered {
+                break;
+            }
             WindowsDisplay::frame(display, !conf.platform.blocking_event_loop);
             if crate::native_display().lock().unwrap().quit_requested {
                 PostMessageW((*display).wnd, WM_CLOSE, 0, 0);
             }
         }
 
+        // DestroyWindow sends focus/size messages. Detach first so shutdown
+        // cannot run application callbacks after the graphics context is gone.
+        if !(*display).window_destroyed {
+            WindowsDisplay::detach(display);
+        }
         ((*display).libopengl32.wglDeleteContext)(gl_ctx);
-        DestroyWindow(wnd);
+        if !(*display).window_destroyed {
+            DestroyWindow(wnd);
+        }
     }
 }

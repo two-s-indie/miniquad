@@ -1,7 +1,62 @@
 //! Geometry transactions and callback delivery shared by the main and modal loops.
 use super::*;
 
+/// Native positions stay signed; conversion to the historical u32 public API
+/// happens only when publishing a complete, validated snapshot.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct Geometry {
+    pub(super) size: (i32, i32),
+    position: (i32, i32),
+    scale: f32,
+}
+
+impl Geometry {
+    fn from_rects(client: RECT, outer: RECT, minimized: bool, scale: f32) -> Option<Self> {
+        let width = client.right.checked_sub(client.left)?;
+        let height = client.bottom.checked_sub(client.top)?;
+        if width < 0
+            || height < 0
+            || (!minimized && (width == 0 || height == 0))
+            || !scale.is_finite()
+            || scale <= 0.0
+        {
+            return None;
+        }
+        Some(Self {
+            // Preserve the nonzero minimized framebuffer policy. Empty normal
+            // rectangles are transient/invalid, not a real 1x1 resize.
+            size: (width.max(1), height.max(1)),
+            position: (outer.left, outer.top),
+            scale,
+        })
+    }
+
+    unsafe fn query(hwnd: HWND, scale: f32) -> Option<Self> {
+        let (mut outer, mut client): (RECT, RECT) = (std::mem::zeroed(), std::mem::zeroed());
+        if GetWindowRect(hwnd, &mut outer) == 0 || GetClientRect(hwnd, &mut client) == 0 {
+            return None;
+        }
+        Self::from_rects(client, outer, IsIconic(hwnd) != 0, scale)
+    }
+}
+
 impl WindowsDisplay {
+    pub(super) unsafe fn stop_modal_timer(this: *mut Self) {
+        let timer = std::mem::replace(&mut (*this).modal_resizing_timer, 0);
+        if timer != 0 {
+            KillTimer((*this).wnd, timer);
+        }
+    }
+
+    pub(super) unsafe fn detach(this: *mut Self) {
+        Self::stop_modal_timer(this);
+        (*this).modal_loop_depth = 0;
+        #[cfg(target_pointer_width = "64")]
+        SetWindowLongPtrW((*this).wnd, GWLP_USERDATA, 0);
+        #[cfg(target_pointer_width = "32")]
+        SetWindowLongW((*this).wnd, GWLP_USERDATA, 0);
+    }
+
     fn render_dpi(&self) -> u32 {
         if self.high_dpi {
             self.window_dpi
@@ -116,33 +171,35 @@ impl WindowsDisplay {
     }
 
     /// Publish scale, actual client pixels and position in one lock acquisition.
-    /// Only framebuffer changes require resize_event; moves alone do not.
-    pub(super) unsafe fn publish_geometry(this: *mut Self) -> Option<(f32, f32)> {
+    /// None means query failure/invalid geometry, not "unchanged". Callers must
+    /// defer callbacks and drawing until a complete valid snapshot is available.
+    pub(super) unsafe fn publish_geometry(this: *mut Self) -> Option<Geometry> {
         let hwnd = (*this).wnd;
-        let (mut rect, mut client): (RECT, RECT) = (std::mem::zeroed(), std::mem::zeroed());
-        if GetWindowRect(hwnd, &mut rect) == 0 || GetClientRect(hwnd, &mut client) == 0 {
-            return None;
-        }
+        let scale = (*this).render_dpi() as f32 / dpi::BASE_DPI as f32;
+        let geometry = Geometry::query(hwnd, scale)?;
         if (*this).cursor_grabbed && IsIconic(hwnd) == 0 {
             update_clip_rect(hwnd);
         }
-        let size = (
-            (client.right - client.left).max(1),
-            (client.bottom - client.top).max(1),
-        );
-        let scale = (*this).render_dpi() as f32 / dpi::BASE_DPI as f32;
         (*this).window_scale = scale;
+        (*this).geometry = Some(geometry);
         let mut d = crate::native_display().lock().unwrap();
-        let resized = size != (d.screen_width, d.screen_height);
-        if resized || scale != d.dpi_scale {
+        let resumed = std::mem::replace(&mut (*this).geometry_suspended, false);
+        let changed =
+            geometry.size != (d.screen_width, d.screen_height) || scale != d.dpi_scale || resumed;
+        if changed {
             (*this).update_requested = true;
         }
         d.dpi_scale = scale;
-        d.screen_width = size.0;
-        d.screen_height = size.1;
+        d.screen_width = geometry.size.0;
+        d.screen_height = geometry.size.1;
         // Keep signed native coordinates until the existing public API boundary.
-        d.screen_position = (rect.left as u32, rect.top as u32);
+        d.screen_position = (geometry.position.0 as u32, geometry.position.1 as u32);
         drop(d);
+        if changed {
+            // Sent WM_SIZE messages can be dispatched inside GetMessage without
+            // returning to the loop. Wake ordinary native resizes too, not only DPI.
+            PostMessageW(hwnd, WM_NULL, 0, 0);
+        }
         if std::mem::replace(&mut (*this).dpi_changed, false) && !(*this).cursor_grabbed {
             // A stationary pointer may have different client coordinates after
             // the transition. Refresh downstream caches without touching raw
@@ -156,46 +213,67 @@ impl WindowsDisplay {
                     .mouse_motion_event(point.x as f32, point.y as f32);
             }
         }
-        if resized {
-            Some((size.0 as f32, size.1 as f32))
-        } else {
-            None
-        }
+        Some(geometry)
     }
 
-    pub(super) unsafe fn flush_events(this: *mut Self) {
-        if (*this).geometry_depth != 0 {
-            return;
+    unsafe fn settle_geometry(this: *mut Self) -> Option<Geometry> {
+        // A resize can select another monitor and send another DPI message.
+        // Finish the latest transition before publishing or calling user code.
+        for _ in 0..4 {
+            match (*this).pending_dpi.take() {
+                Some((dpi, rect)) => Self::apply_dpi(this, dpi, rect),
+                None => break,
+            }
+        }
+        if (*this).pending_dpi.is_some() {
+            PostMessageW((*this).wnd, WM_NULL, 0, 0);
+            return None;
+        }
+        let geometry = Self::publish_geometry(this);
+        if geometry.is_none() {
+            // Keep the previous snapshot and queued events. A later native
+            // message can retry; a blocking loop need not spin on a failed query.
+            (*this).update_requested = false;
+            (*this).geometry_suspended = true;
+        }
+        geometry
+    }
+
+    pub(super) unsafe fn flush_events(this: *mut Self) -> bool {
+        if (*this).geometry_depth != 0
+            || (*this).notification_depth != 0
+            || (*this).window_destroyed
+            || crate::native_display().lock().unwrap().quit_ordered
+        {
+            return false;
         }
         // Owning the handler locally prevents aliasing if user code itself calls
         // Win32. Nested messages are queued and delivered after the callback.
         let mut handler = match (*this).event_handler.take() {
             Some(handler) => handler,
-            None => return,
+            None => {
+                // Before the factory returns, maintain geometry without invoking
+                // application callbacks. During a callback, defer all nested work.
+                return (*this).initializing && Self::settle_geometry(this).is_some();
+            }
         };
-        loop {
-            // A resize can select another monitor and send another DPI message.
-            // Finish the latest transition before publishing or calling user code.
-            for _ in 0..4 {
-                match (*this).pending_dpi.take() {
-                    Some((dpi, rect)) => Self::apply_dpi(this, dpi, rect),
-                    None => break,
-                }
+        let ready = loop {
+            if (*this).window_destroyed || crate::native_display().lock().unwrap().quit_ordered {
+                break false;
             }
-            if (*this).pending_dpi.is_some() {
-                // Bound synchronous work if Windows keeps constraining geometry.
-                // The main/modal loop will resume the remaining transition.
-                PostMessageW((*this).wnd, WM_NULL, 0, 0);
-                break;
-            }
-            if let Some((width, height)) = Self::publish_geometry(this) {
-                handler.resize_event(width, height);
+            let geometry = match Self::settle_geometry(this) {
+                Some(geometry) => geometry,
+                None => break false,
+            };
+            if (*this).notified_size != Some(geometry.size) {
+                (*this).notified_size = Some(geometry.size);
+                handler.resize_event(geometry.size.0 as f32, geometry.size.1 as f32);
                 // A callback may itself have caused another native transition.
                 continue;
             }
             let event = match (*this).events.0.pop_front() {
                 Some(event) => event,
-                None => break,
+                None => break true,
             };
             if matches!(event, events::Event::Quit) {
                 let ordered = {
@@ -220,30 +298,28 @@ impl WindowsDisplay {
             } else {
                 event.dispatch(handler.as_mut());
             }
-        }
+        };
         (*this).event_handler = Some(handler);
+        ready
     }
 
     pub(super) unsafe fn frame(this: *mut Self, force: bool) {
-        Self::flush_events(this);
-        if (*this).geometry_depth != 0
-            || (*this).pending_dpi.is_some()
-            || (!force && !(*this).update_requested)
-        {
+        if !Self::flush_events(this) || (!force && !(*this).update_requested) {
             return;
         }
         if let Some(mut handler) = (*this).event_handler.take() {
             (*this).update_requested = false;
             handler.update();
             (*this).event_handler = Some(handler);
-            Self::flush_events(this);
-            if (*this).pending_dpi.is_some() {
+            if !Self::flush_events(this) {
                 return;
             }
             let mut handler = (*this).event_handler.take().unwrap();
             handler.draw();
             (*this).event_handler = Some(handler);
-            SwapBuffers((*this).dc);
+            if !(*this).window_destroyed && !crate::native_display().lock().unwrap().quit_ordered {
+                SwapBuffers((*this).dc);
+            }
         }
     }
 
@@ -343,5 +419,77 @@ impl WindowsDisplay {
         }
         (*this).geometry_depth -= 1;
         Self::flush_events(this);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn checked_geometry_keeps_fractional_pixels_and_signed_positions() {
+        let client = RECT {
+            left: 0,
+            top: 0,
+            right: 1402,
+            bottom: 1052,
+        };
+        let outer = RECT {
+            left: -1901,
+            top: -701,
+            right: -471,
+            bottom: 418,
+        };
+        assert_eq!(
+            Geometry::from_rects(client, outer, false, 1.75),
+            Some(Geometry {
+                size: (1402, 1052),
+                position: (-1901, -701),
+                scale: 1.75,
+            })
+        );
+    }
+
+    #[test]
+    fn failed_and_invalid_geometry_never_become_resize_notifications() {
+        let outer: RECT = unsafe { std::mem::zeroed() };
+        let empty = RECT {
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
+        };
+        assert!(unsafe { Geometry::query(std::ptr::null_mut(), 1.75) }.is_none());
+        assert_eq!(Geometry::from_rects(empty, outer, false, 1.75), None);
+        assert_eq!(
+            Geometry::from_rects(empty, outer, true, 1.75).unwrap().size,
+            (1, 1)
+        );
+        for client in [
+            RECT {
+                left: 0,
+                top: 0,
+                right: -1,
+                bottom: 10,
+            },
+            RECT {
+                left: i32::MIN,
+                top: 0,
+                right: i32::MAX,
+                bottom: 10,
+            },
+        ] {
+            assert_eq!(Geometry::from_rects(client, outer, false, 1.0), None);
+            assert_eq!(Geometry::from_rects(client, outer, true, 1.0), None);
+        }
+        let valid = RECT {
+            left: 0,
+            top: 0,
+            right: 10,
+            bottom: 20,
+        };
+        for scale in [0.0, -1.0, f32::INFINITY, f32::NAN] {
+            assert_eq!(Geometry::from_rects(valid, outer, false, scale), None);
+        }
     }
 }

@@ -26,9 +26,14 @@ unsafe fn symbol<T: Copy>(name: &[u8]) -> Option<T> {
 
 struct App {
     runtime_size: Option<(f32, f32)>,
+    destroy_window: Option<HWND>,
 }
 impl EventHandler for App {
     fn update(&mut self) {
+        if let Some(hwnd) = self.destroy_window.take() {
+            assert_ne!(unsafe { DestroyWindow(hwnd) }, 0);
+            return;
+        }
         if let Some(expected) = self.runtime_size.take() {
             assert_eq!(
                 window::screen_size(),
@@ -42,7 +47,9 @@ impl EventHandler for App {
             window::order_quit();
         }
     }
-    fn draw(&mut self) {}
+    fn draw(&mut self) {
+        panic!("draw ran after update ordered quit or destroyed the window");
+    }
 }
 
 #[test]
@@ -61,6 +68,7 @@ fn startup_contract() {
                 "host-thread-unaware",
                 "fixed-size",
                 "runtime-size",
+                "destroy-window",
             ] {
                 let mut child = std::process::Command::new(std::env::current_exe().unwrap())
                     .args([
@@ -213,11 +221,20 @@ fn startup_contract() {
                 let runtime_size = if mode == "runtime-size" {
                     window::set_window_size(1173, 853);
                     Some((1173.0, 853.0))
+                } else if mode == "destroy-window" {
+                    None
                 } else {
                     window::order_quit();
                     None
                 };
-                Box::new(App { runtime_size })
+                Box::new(App {
+                    runtime_size,
+                    destroy_window: if mode == "destroy-window" {
+                        Some(hwnd)
+                    } else {
+                        None
+                    },
+                })
             },
         );
     }

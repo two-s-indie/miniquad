@@ -280,6 +280,71 @@ cargo test --test windows_dpi_transition -- --nocapture
 cargo test --lib native::windows::dpi::tests
 ```
 
+## Step 4: geometry and event delivery (2026-11-01)
+
+Step 3 already established actual client-pixel sizing, size-only resize callbacks,
+signed DPI placement, and shared main/modal delivery. Step 4 adds checked geometry
+snapshots and closes gaps around initialization, native message nesting, recovery,
+and shutdown.
+
+Geometry queries now distinguish failure from an unchanged result. Reversed,
+overflowing, and empty normal client dimensions are rejected; the previous public
+snapshot remains intact and callbacks/drawing wait for valid geometry. A minimized
+client keeps the existing nonzero policy (an empty client reports 1 x 1). Recovery
+requests a frame even if the resulting size equals the last valid size. Native
+positions remain signed internally; the existing public `u32` API is unchanged.
+
+`WM_WINDOWPOSCHANGED` and its nested size/move messages finish before callbacks
+are delivered. Non-client calculation does not trigger premature notification.
+The backend queries actual dimensions rather than trusting the truncated fields
+in `WM_SIZE`. The Win32 nesting follows the documented
+[default window-position handling](https://learn.microsoft.com/en-us/windows/win32/winmsg/wm-windowposchanged).
+
+The native payload is attached after shared state and WGL are ready, before
+`ShowWindow` and the application factory. DPI/geometry messages during that phase
+update public state and queue events until the handler exists. Showing the window
+does not replace logical startup intent with its rounded physical size.
+
+Ordinary native resizes now wake a blocking `GetMessage` wait, just as DPI changes
+do. Nested move/menu loops share one active redraw timer until the final exit;
+already-queued timer messages are ignored afterward. This matters because
+[`KillTimer` does not remove queued timer messages](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-killtimer).
+`GetMessage` quit/error results stop the loop without dispatching stale message
+data. An accepted quit or native destruction stops further callbacks/drawing,
+and teardown detaches the payload before deleting the graphics context.
+
+### Step 4 validation results
+
+The full Windows all-target test suite passed. The startup suite now includes
+eleven isolated cases, including destruction from inside `update`; the four
+runtime cases still cover high/low DPI with normal/blocking loops. New checks
+verify:
+
+- DPI messages during the application factory update public geometry before a
+  handler is returned.
+- Position-only moves and duplicate `WM_SIZE` messages do not emit resize callbacks;
+  callbacks observe client dimensions and position from the same native state.
+- A native resize produces exactly one resize callback and wakes blocking mode
+  without a posted test wake-up or user input.
+- A real empty normal client area, produced through a test `WM_NCCALCSIZE` hook,
+  does not publish a fabricated resize, draw, or deliver queued input. Restoring
+  valid geometry at the same size resumes input and redraws without a resize event.
+- Nested move/menu timers continue until the outer loop exits. Replayed stale
+  timer messages do not draw after exit.
+- A canceled close keeps the window running; an accepted close stops callbacks.
+  Ordering quit or destroying the window during `update` does not call `draw`.
+
+Checked-geometry unit tests cover failed HWND queries, negative and overflowing
+dimensions, signed positions, fractional-scale pixels, and minimized dimensions.
+Rust 1.70 Windows library compilation and all-target Linux/Wasm checks passed.
+The paired Macroquad diagnostic was rebuilt against this checkout and passed the
+same high/low-DPI blocking transition checks recorded in step 3; logs are in
+`target/dpi-validation/step4-macroquad-{high,low}.log` (not versioned). Existing
+unrelated compiler and incremental-cache warnings remain.
+
+These tests use real windows but injected DPI messages. They do not replace the
+physical-monitor and interactive integration checks below.
+
 ## Remaining physical-monitor checks
 
 Record actual display scales, awareness mode, requested size, native client
