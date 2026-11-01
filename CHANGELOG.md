@@ -7,6 +7,7 @@ Completed changes in the [two-s-indie Miniquad fork](https://github.com/two-s-in
 ### Added
 
 - Added this fork changelog and repository instructions in `AGENTS.md` requiring changelog updates with commits and recurring checks for undocumented changes.
+- Added a DPI diagnostic example with geometry/input logging, a centered hit-test rectangle, runtime resize controls, and high-DPI, low-DPI, odd-size, and blocking-loop modes. Added a validation guide with the recorded 175% startup baseline and instructions for testing the paired Macroquad example against this checkout.
 
 ## 2026-11-01
 
