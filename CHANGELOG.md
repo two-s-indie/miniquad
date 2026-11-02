@@ -27,6 +27,9 @@ Completed changes in the [two-s-indie Miniquad fork](https://github.com/two-s-in
 
 ### Changed
 
+- Updated the `glam` development dependency from 0.24 to 0.34.2 and migrated the instancing, offscreen, MSAA render texture, and post-processing examples to its camera API, preserving right-handed views and OpenGL projection depth.
+- Raised the minimum Rust version and its CI check from 1.70 to 1.87 to support the updated development dependencies, including `fontdue` 0.9.5's integer casts.
+- Updated the `quad-rand` development dependency from 0.1 to 0.2.3 for random particle and blob motion in the examples.
 - Updated the `fontdue` development dependency from 0.8 to 0.9.5 for text rendering in the IME example.
 - Clarified in `AGENTS.md` that `game` is this fork's main development branch.
 - **Windows high-DPI startup sizing:** `Conf.window_width` and `Conf.window_height` now specify logical client dimensions for normal high-DPI windows. For example, 800 x 600 at 175% becomes a 1400 x 1050 framebuffer. Runtime size requests remain in framebuffer pixels; low-DPI startup keeps unscaled dimensions and rendering scale 1, including in a per-monitor-aware host.

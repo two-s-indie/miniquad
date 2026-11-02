@@ -1,6 +1,6 @@
 use miniquad::*;
 
-use glam::{vec3, Mat4};
+use glam::{camera::rh, vec3, Mat4};
 
 struct Stage {
     display_pipeline: Pipeline,
@@ -172,8 +172,8 @@ impl EventHandler for Stage {
 
     fn draw(&mut self) {
         let (width, height) = window::screen_size();
-        let proj = Mat4::perspective_rh_gl(60.0f32.to_radians(), width / height, 0.01, 10.0);
-        let view = Mat4::look_at_rh(
+        let proj = rh::proj::opengl::perspective(60.0f32.to_radians(), width / height, 0.01, 10.0);
+        let view = rh::view::look_at_mat4(
             vec3(0.0, 1.5, 3.0),
             vec3(0.0, 0.0, 0.0),
             vec3(0.0, 1.0, 0.0),

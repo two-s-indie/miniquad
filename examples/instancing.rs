@@ -1,6 +1,6 @@
 use miniquad::*;
 
-use glam::{vec3, Mat4, Vec3};
+use glam::{camera::rh, vec3, Mat4, Vec3};
 
 const MAX_PARTICLES: usize = 512 * 1024;
 const NUM_PARTICLES_EMITTED_PER_FRAME: usize = 10;
@@ -147,8 +147,8 @@ impl EventHandler for Stage {
         // model-view-projection matrix
         let (width, height) = window::screen_size();
 
-        let proj = Mat4::perspective_rh_gl(60.0f32.to_radians(), width / height, 0.01, 50.0);
-        let view = Mat4::look_at_rh(
+        let proj = rh::proj::opengl::perspective(60.0f32.to_radians(), width / height, 0.01, 50.0);
+        let view = rh::view::look_at_mat4(
             vec3(0.0, 1.5, 12.0),
             vec3(0.0, 0.0, 0.0),
             vec3(0.0, 1.0, 0.0),

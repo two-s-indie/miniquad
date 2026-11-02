@@ -78,7 +78,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions-rs/toolchain@v1
         with:
-          toolchain: '1.70.0'
+          toolchain: '1.87.0'
           override: true
       - name: Verify MSRV
         run: cargo build --all-targets
