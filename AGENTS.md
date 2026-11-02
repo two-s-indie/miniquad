@@ -4,6 +4,7 @@
 
 - This is the `two-s-indie/miniquad` fork, maintained for bug fixes and the 2D game **Where's the Yokai?**.
 - Related repositories are siblings: `../macroquad`, `../quad-snd`, and `../Where-s-the-Yokai`, under the [two-s-indie GitHub organization](https://github.com/two-s-indie).
+- The main development branch of this fork is `game`. Use `game` as the default base for work in this repository.
 - The game uses the Miniquad and Macroquad forks' `game` branches.
 
 ## Changelog maintenance
