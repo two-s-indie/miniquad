@@ -15,6 +15,8 @@ Completed changes in the [two-s-indie Miniquad fork](https://github.com/two-s-in
 
 ### Fixed
 
+- **Windows FFI declarations:** Use 32-bit Win32 `BOOL` returns for core WGL context operations and the pixel-format and swap-interval extensions, with zero/nonzero success checks. Mark dynamically loaded WGL functions unsafe, reuse available `winapi` IMM declarations, and match the remaining IMM signatures to the Windows SDK.
+- **OpenGL ABI:** Call native OpenGL functions using the system calling convention (stdcall on 32-bit Windows), and use pointer-sized buffer lengths and offsets on 64-bit Windows. Corrected the window-userdata argument type that blocked 32-bit Windows builds. Added signature, return-width, IMM layout, and mock buffer-dispatch regression checks.
 - **Windows input and IME integration:** Use each mouse-button message's signed client coordinates instead of a stale motion cache. Refresh absolute mouse coordinates after releasing a cursor grab, ignore failed or empty clip-rectangle queries, and retain explicitly requested IME pixel anchors when composition starts.
 - **Windows startup DPI:** Establish per-monitor awareness before creating any window when the host has not already chosen an awareness mode. Query DPI from the actual main window and correct its hidden client geometry using DPI-aware border metrics before showing it after WGL initialization. Newer DPI APIs are loaded dynamically, with checked legacy and failed-query fallbacks.
 - **Windows framebuffer dimensions:** Publish the actual client size without the fractional-scale divide/truncate/multiply round trip, and update size and position together. Normal and fullscreen startup windows remain hidden until the graphics context is ready.

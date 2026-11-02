@@ -1,7 +1,8 @@
 #![allow(dead_code, non_snake_case)]
 use winapi::{
     shared::{
-        minwindef::{INT, UINT},
+        minwindef::{BOOL, INT, UINT},
+        ntdef::LPCSTR,
         windef::{HDC, HGLRC},
     },
     um::{errhandlingapi::GetLastError, wingdi::*},
@@ -57,12 +58,60 @@ pub const ERROR_INVALID_VERSION_ARB: u32 = 0x2095;
 pub const ERROR_INVALID_PROFILE_ARB: u32 = 0x2096;
 pub const ERROR_INCOMPATIBLE_DEVICE_CONTEXTS_ARB: u32 = 0x2054;
 
+// Signatures from Khronos api/GL/wglext.h. BOOL success is any nonzero value.
 type GetPixelFormatAttribivARB =
-    extern "system" fn(_: HDC, _: INT, _: INT, _: UINT, _: *const INT, _: *mut INT) -> bool;
-type GetExtensionsStringEXT = extern "system" fn() -> *const i8;
-type GetExtensionsStringARB = extern "system" fn(_: HDC) -> *const i8;
-type CreateContextAttribsARB = extern "system" fn(_: HDC, _: HGLRC, _: *const INT) -> HGLRC;
-type SwapIntervalEXT = extern "system" fn(_: INT) -> bool;
+    unsafe extern "system" fn(_: HDC, _: INT, _: INT, _: UINT, _: *const INT, _: *mut INT) -> BOOL;
+type GetExtensionsStringEXT = unsafe extern "system" fn() -> LPCSTR;
+type GetExtensionsStringARB = unsafe extern "system" fn(_: HDC) -> LPCSTR;
+type CreateContextAttribsARB = unsafe extern "system" fn(_: HDC, _: HGLRC, _: *const INT) -> HGLRC;
+type SwapIntervalEXT = unsafe extern "system" fn(_: INT) -> BOOL;
+
+#[cfg(test)]
+mod ffi_tests {
+    use super::*;
+
+    #[test]
+    fn extension_bool_returns_preserve_noncanonical_success_values() {
+        // Independent native signatures from wglext.h: notably BOOL, not bool.
+        unsafe extern "system" fn swap_interval(interval: INT) -> BOOL {
+            interval
+        }
+        unsafe extern "system" fn pixel_format(
+            _: HDC,
+            _: INT,
+            _: INT,
+            count: UINT,
+            attributes: *const INT,
+            values: *mut INT,
+        ) -> BOOL {
+            for i in 0..count as usize {
+                *values.add(i) = *attributes.add(i) + 1;
+            }
+            0x100
+        }
+        let swap_interval: SwapIntervalEXT = swap_interval;
+        let pixel_format: GetPixelFormatAttribivARB = pixel_format;
+        unsafe {
+            for result in [0, 1, 0x100, -1] {
+                assert_eq!(swap_interval(result), result);
+            }
+            let attributes = [WGL_RED_BITS_ARB as INT, WGL_DEPTH_BITS_ARB as INT];
+            let mut values = [0; 2];
+            assert_eq!(
+                pixel_format(
+                    std::ptr::null_mut(),
+                    1,
+                    0,
+                    2,
+                    attributes.as_ptr(),
+                    values.as_mut_ptr(),
+                ),
+                0x100,
+            );
+            assert_eq!(values, [attributes[0] + 1, attributes[1] + 1]);
+        }
+    }
+}
 
 #[derive(Copy, Clone)]
 pub struct GlFbconfig {
@@ -231,7 +280,7 @@ impl Wgl {
         if rc.is_null() {
             panic!("WGL: Failed to create dummy context");
         }
-        if !(display.libopengl32.wglMakeCurrent)(display.msg_dc, rc) {
+        if (display.libopengl32.wglMakeCurrent)(display.msg_dc, rc) == 0 {
             panic!("WGL: Failed to make context current");
         }
 
@@ -302,14 +351,15 @@ impl Wgl {
         attrib: i32,
     ) -> i32 {
         let mut value = 0;
-        if !(self.GetPixelFormatAttribivARB.unwrap())(
+        if (self.GetPixelFormatAttribivARB.unwrap())(
             display.dc,
             pixel_format,
             0,
             1,
             &attrib,
             &mut value as *mut _,
-        ) {
+        ) == 0
+        {
             panic!("WGL: Failed to retrieve pixel format attribute");
         }
         value

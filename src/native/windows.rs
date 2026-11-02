@@ -10,13 +10,16 @@ use crate::{
 use winapi::{
     shared::{
         hidusage::{HID_USAGE_GENERIC_MOUSE, HID_USAGE_PAGE_GENERIC},
-        minwindef::{DWORD, HIWORD, LOWORD, LPARAM, LRESULT, TRUE, UINT, WPARAM},
-        ntdef::NULL,
+        minwindef::{BOOL, DWORD, HIWORD, LOWORD, LPARAM, LPVOID, LRESULT, TRUE, UINT, WPARAM},
+        ntdef::{LONG, NULL},
         windef::{HBRUSH, HCURSOR, HDC, HICON, HWND, POINT, RECT},
         windowsx::{GET_X_LPARAM, GET_Y_LPARAM},
     },
     um::{
-        imm::{ImmGetContext, ImmReleaseContext, HIMC},
+        imm::{
+            ImmGetContext, ImmGetOpenStatus, ImmReleaseContext, ImmSetCompositionWindow,
+            ImmSetOpenStatus, COMPOSITIONFORM, HIMC,
+        },
         libloaderapi::{GetModuleHandleW, GetProcAddress},
         shellapi::{DragAcceptFiles, DragQueryFileW, HDROP},
         wingdi::*,
@@ -53,15 +56,6 @@ const CFS_CANDIDATEPOS: DWORD = 0x0040;
 // ImmAssociateContextEx flags
 const IACE_DEFAULT: DWORD = 0x0010;
 
-// COMPOSITIONFORM structure
-#[repr(C)]
-#[allow(non_snake_case)]
-struct COMPOSITIONFORM {
-    dwStyle: DWORD,
-    ptCurrentPos: POINT,
-    rcArea: RECT,
-}
-
 // CANDIDATEFORM structure
 #[repr(C)]
 #[allow(non_snake_case)]
@@ -72,22 +66,30 @@ struct CANDIDATEFORM {
     rcArea: RECT,
 }
 
-// Link to imm32.dll for IME support
+#[cfg(test)]
+mod ime_ffi_tests {
+    use super::*;
+
+    #[test]
+    fn candidate_form_matches_windows_sdk_layout() {
+        // imm.h: two DWORDs, a POINT and a RECT; identical on Win32 and Win64.
+        assert_eq!(std::mem::size_of::<CANDIDATEFORM>(), 32);
+        assert_eq!(std::mem::align_of::<CANDIDATEFORM>(), 4);
+        assert_eq!(std::mem::offset_of!(CANDIDATEFORM, dwIndex), 0);
+        assert_eq!(std::mem::offset_of!(CANDIDATEFORM, dwStyle), 4);
+        assert_eq!(std::mem::offset_of!(CANDIDATEFORM, ptCurrentPos), 8);
+        assert_eq!(std::mem::offset_of!(CANDIDATEFORM, rcArea), 16);
+    }
+}
+
+// IMM declarations not provided by winapi 0.3.9, matching the Windows SDK imm.h.
 #[link(name = "imm32")]
 extern "system" {
-    fn ImmGetCompositionStringW(
-        himc: HIMC,
-        index: DWORD,
-        buf: *mut std::ffi::c_void,
-        len: DWORD,
-    ) -> i32;
-    fn ImmAssociateContextEx(hwnd: HWND, himc: HIMC, flags: DWORD) -> i32;
+    fn ImmGetCompositionStringW(himc: HIMC, index: DWORD, buf: LPVOID, len: DWORD) -> LONG;
+    fn ImmAssociateContextEx(hwnd: HWND, himc: HIMC, flags: DWORD) -> BOOL;
     fn ImmAssociateContext(hwnd: HWND, himc: HIMC) -> HIMC;
     fn ImmCreateContext() -> HIMC;
-    fn ImmSetCompositionWindow(himc: HIMC, lpCompForm: *const COMPOSITIONFORM) -> i32;
-    fn ImmSetCandidateWindow(himc: HIMC, lpCandidate: *const CANDIDATEFORM) -> i32;
-    fn ImmGetOpenStatus(himc: HIMC) -> i32;
-    fn ImmSetOpenStatus(himc: HIMC, fOpen: i32) -> i32;
+    fn ImmSetCandidateWindow(himc: HIMC, lpCandidate: *mut CANDIDATEFORM) -> BOOL;
 }
 
 // IME Association flags
@@ -179,21 +181,21 @@ impl WindowsDisplay {
             }
 
             // Set composition window position (where the composing text appears)
-            let comp_form = COMPOSITIONFORM {
+            let mut comp_form = COMPOSITIONFORM {
                 dwStyle: CFS_POINT,
                 ptCurrentPos: POINT { x, y },
                 rcArea: std::mem::zeroed(),
             };
-            ImmSetCompositionWindow(himc, &comp_form);
+            ImmSetCompositionWindow(himc, &mut comp_form);
 
             // Set candidate window position (the popup with character choices)
-            let cand_form = CANDIDATEFORM {
+            let mut cand_form = CANDIDATEFORM {
                 dwIndex: 0,
                 dwStyle: CFS_CANDIDATEPOS,
                 ptCurrentPos: POINT { x, y },
                 rcArea: std::mem::zeroed(),
             };
-            ImmSetCandidateWindow(himc, &cand_form);
+            ImmSetCandidateWindow(himc, &mut cand_form);
 
             ImmReleaseContext((*this).wnd, himc);
         }
@@ -714,7 +716,7 @@ unsafe fn window_message(
                 let mut pt: POINT = std::mem::zeroed();
                 GetCaretPos(&mut pt);
 
-                let comp_form = COMPOSITIONFORM {
+                let mut comp_form = COMPOSITIONFORM {
                     dwStyle: CFS_POINT,
                     ptCurrentPos: pt,
                     rcArea: RECT {
@@ -724,10 +726,10 @@ unsafe fn window_message(
                         bottom: 0,
                     },
                 };
-                ImmSetCompositionWindow(himc, &comp_form);
+                ImmSetCompositionWindow(himc, &mut comp_form);
 
                 // Set candidate window position (most IMEs only use index 0)
-                let cand_form = CANDIDATEFORM {
+                let mut cand_form = CANDIDATEFORM {
                     dwIndex: 0,
                     dwStyle: CFS_CANDIDATEPOS,
                     ptCurrentPos: POINT {
@@ -741,7 +743,7 @@ unsafe fn window_message(
                         bottom: 0,
                     },
                 };
-                ImmSetCandidateWindow(himc, &cand_form);
+                ImmSetCandidateWindow(himc, &mut cand_form);
 
                 ImmReleaseContext(hwnd, himc);
             }
@@ -1238,7 +1240,7 @@ where
         #[cfg(target_pointer_width = "64")]
         SetWindowLongPtrW(wnd, GWLP_USERDATA, display as isize);
         #[cfg(target_pointer_width = "32")]
-        SetWindowLongW(wnd, GWLP_USERDATA, display as isize);
+        SetWindowLongW(wnd, GWLP_USERDATA, display as LONG);
 
         // IMPORTANT: Show window AFTER WGL context is created
         // This ensures IME initializes correctly when window gains focus

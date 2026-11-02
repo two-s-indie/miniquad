@@ -40,7 +40,7 @@ pub fn calls() -> Vec<Call> {
 macro_rules! stubs {
     ($($name:ident($($arg:ident: $ty:ty),*);)*) => {
         $(#[allow(non_snake_case, unused_variables)]
-        extern "C" fn $name($($arg: $ty),*) {})*
+        extern "system" fn $name($($arg: $ty),*) {})*
 
         fn load() {
             load_gl_funcs(|name| {
@@ -83,10 +83,10 @@ stubs! {
     glColorMask(r: u8, g: u8, b: u8, a: u8); glDepthFunc(x: u32);
 }
 
-extern "C" fn get_string(_: u32) -> *const u8 {
+extern "system" fn get_string(_: u32) -> *const u8 {
     b"3.3\0".as_ptr()
 }
-extern "C" fn get_integer(name: u32, value: *mut i32) {
+extern "system" fn get_integer(name: u32, value: *mut i32) {
     unsafe {
         *value = if name == GL_PACK_ALIGNMENT {
             *PACK_ALIGNMENT.lock().unwrap()
@@ -95,49 +95,49 @@ extern "C" fn get_integer(name: u32, value: *mut i32) {
         };
     }
 }
-extern "C" fn pixel_store(name: u32, value: i32) {
+extern "system" fn pixel_store(name: u32, value: i32) {
     if name == GL_PACK_ALIGNMENT {
         *PACK_ALIGNMENT.lock().unwrap() = value;
     }
 }
-extern "C" fn generate(count: i32, values: *mut u32) {
+extern "system" fn generate(count: i32, values: *mut u32) {
     for i in 0..count {
         unsafe {
             *values.add(i as usize) = i as u32 + 1;
         }
     }
 }
-extern "C" fn create_shader(kind: u32) -> u32 {
+extern "system" fn create_shader(kind: u32) -> u32 {
     kind
 }
-extern "C" fn create_program() -> u32 {
+extern "system" fn create_program() -> u32 {
     1
 }
-extern "C" fn get_status(_: u32, _: u32, value: *mut i32) {
+extern "system" fn get_status(_: u32, _: u32, value: *mut i32) {
     unsafe {
         *value = 1;
     }
 }
-extern "C" fn uniform_location(_: u32, name: *const i8) -> i32 {
+extern "system" fn uniform_location(_: u32, name: *const i8) -> i32 {
     if unsafe { std::ffi::CStr::from_ptr(name) }.to_bytes() == b"inactive" {
         -1
     } else {
         0
     }
 }
-extern "C" fn uniform1(_: i32, count: i32, pointer: *const c_void) {
+extern "system" fn uniform1(_: i32, count: i32, pointer: *const c_void) {
     record_uniform(1, count, pointer);
 }
-extern "C" fn uniform2(_: i32, count: i32, pointer: *const c_void) {
+extern "system" fn uniform2(_: i32, count: i32, pointer: *const c_void) {
     record_uniform(2, count, pointer);
 }
-extern "C" fn uniform3(_: i32, count: i32, pointer: *const c_void) {
+extern "system" fn uniform3(_: i32, count: i32, pointer: *const c_void) {
     record_uniform(3, count, pointer);
 }
-extern "C" fn uniform4(_: i32, count: i32, pointer: *const c_void) {
+extern "system" fn uniform4(_: i32, count: i32, pointer: *const c_void) {
     record_uniform(4, count, pointer);
 }
-extern "C" fn uniform_matrix(_: i32, count: i32, _: u8, pointer: *const f32) {
+extern "system" fn uniform_matrix(_: i32, count: i32, _: u8, pointer: *const f32) {
     record_uniform(16, count, pointer as _);
 }
 fn record_uniform(components: usize, count: i32, pointer: *const c_void) {
@@ -147,7 +147,7 @@ fn record_uniform(components: usize, count: i32, pointer: *const c_void) {
         pointer: pointer as usize,
     });
 }
-extern "C" fn tex_image(
+extern "system" fn tex_image(
     _: u32,
     _: i32,
     _: i32,
@@ -165,7 +165,7 @@ extern "C" fn tex_image(
         kind,
     });
 }
-extern "C" fn read_pixels(
+extern "system" fn read_pixels(
     _: i32,
     _: i32,
     width: i32,

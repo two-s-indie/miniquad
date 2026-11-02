@@ -294,6 +294,13 @@ mod tests {
     use std::cell::{Cell, RefCell};
     use winapi::{shared::winerror::ERROR_ACCESS_DENIED, um::errhandlingapi::SetLastError};
 
+    // Type-check the optional entry points without changing dynamic loading.
+    const _: SetProcessContext = winapi::um::winuser::SetProcessDpiAwarenessContext;
+    const _: SetProcessAwareness = winapi::um::shellscalingapi::SetProcessDpiAwareness;
+    const _: GetWindowDpi = winapi::um::winuser::GetDpiForWindow;
+    const _: GetMonitorDpi = winapi::um::shellscalingapi::GetDpiForMonitor;
+    const _: AdjustForDpi = winapi::um::winuser::AdjustWindowRectExForDpi;
+
     #[test]
     fn transition_size_intent_does_not_accumulate_rounding() {
         let logical = ClientSize::new((801, 601), BASE_DPI);

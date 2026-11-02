@@ -14,9 +14,11 @@ pub type GLuint64 = ::core::ffi::c_ulonglong;
 pub type GLsizei = ::core::ffi::c_int;
 pub type GLchar = ::core::ffi::c_char;
 
-pub type khronos_ssize_t = ::core::ffi::c_long;
-pub type khronos_usize_t = ::core::ffi::c_ulong;
-pub type khronos_intptr_t = ::core::ffi::c_long;
+// Khronos sizes and offsets are pointer-sized, including on LLP64 Windows
+// where C long remains 32 bits.
+pub type khronos_ssize_t = isize;
+pub type khronos_usize_t = usize;
+pub type khronos_intptr_t = isize;
 
 pub type GLsizeiptr = khronos_ssize_t;
 pub type GLintptr = khronos_intptr_t;
@@ -316,7 +318,8 @@ macro_rules! gl_loader {
             use super::*;
 
             $(
-                pub static mut $fn: Option<extern "C" fn ($($arg: $t),*) -> $res> = None;
+                // OpenGL's APIENTRY is stdcall on 32-bit Windows, C elsewhere.
+                pub static mut $fn: Option<unsafe extern "system" fn ($($arg: $t),*) -> $res> = None;
             )*
         }
 
@@ -327,6 +330,8 @@ macro_rules! gl_loader {
             }
         )*
 
+        // The callback returns an erased address; it is never called with this
+        // placeholder signature. Calls use the typed APIENTRY pointers above.
         pub fn load_gl_funcs<T: FnMut(&str) -> Option<unsafe extern "C" fn() -> ()>>(mut getprocaddr: T) {
             $(
                 unsafe {
@@ -664,4 +669,40 @@ pub unsafe fn is_gl2() -> bool {
     version_string.is_empty()
         || version_string.starts_with("2")
         || version_string.starts_with("OpenGL ES 2")
+}
+
+#[cfg(test)]
+mod ffi_tests {
+    use super::*;
+
+    #[test]
+    fn dispatched_functions_use_api_entry() {
+        // On x86 Windows these types differ from extern "C". Check the actual
+        // dispatch slots without loading GL or touching their mutable contents.
+        let _: *const Option<unsafe extern "system" fn(GLenum)> =
+            std::ptr::addr_of!(__pfns::glEnable);
+        let _: *const Option<
+            unsafe extern "system" fn(GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, *mut GLvoid),
+        > = std::ptr::addr_of!(__pfns::glReadPixels);
+    }
+
+    #[test]
+    fn buffer_sizes_and_offsets_are_pointer_sized() {
+        assert_eq!(
+            std::mem::size_of::<GLsizeiptr>(),
+            std::mem::size_of::<isize>()
+        );
+        assert_eq!(
+            std::mem::size_of::<GLintptr>(),
+            std::mem::size_of::<isize>()
+        );
+        assert_eq!(
+            std::mem::size_of::<khronos_usize_t>(),
+            std::mem::size_of::<usize>()
+        );
+        let _: *const Option<unsafe extern "system" fn(GLenum, isize, *const GLvoid, GLenum)> =
+            std::ptr::addr_of!(__pfns::glBufferData);
+        let _: *const Option<unsafe extern "system" fn(GLenum, isize, isize, *const GLvoid)> =
+            std::ptr::addr_of!(__pfns::glBufferSubData);
+    }
 }
