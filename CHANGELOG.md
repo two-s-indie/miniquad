@@ -27,8 +27,8 @@ Completed changes in the [two-s-indie Miniquad fork](https://github.com/two-s-in
 
 ### Changed
 
+- Updated the `fontdue` development dependency from 0.8 to 0.9.5 for text rendering in the IME example.
 - Clarified in `AGENTS.md` that `game` is this fork's main development branch.
-
 - **Windows high-DPI startup sizing:** `Conf.window_width` and `Conf.window_height` now specify logical client dimensions for normal high-DPI windows. For example, 800 x 600 at 175% becomes a 1400 x 1050 framebuffer. Runtime size requests remain in framebuffer pixels; low-DPI startup keeps unscaled dimensions and rendering scale 1, including in a per-monitor-aware host.
 
 ## 2026-11-01
@@ -45,8 +45,6 @@ Completed changes in the [two-s-indie Miniquad fork](https://github.com/two-s-in
 - Regression tests for Windows dropped-path lengths and Unicode, Metal uniform capacity boundaries, and X11 property element sizes and invalid lengths, alongside the corresponding fixes above.
 
 ### Changed
-
-- Clarified in `AGENTS.md` that `game` is this fork's main development branch.
 
 - Normalized Rust formatting in the IME example and platform backends. ([`1508486`](https://github.com/two-s-indie/miniquad/commit/15084866b1af2bfe8bf736e1136c38a41545640a))
 
