@@ -164,9 +164,9 @@ impl DpiApi {
             bottom: size.1,
         };
         let mut rect = client;
-        let adjusted = self.adjust_for_dpi.map_or(false, |adjust| {
-            adjust(&mut rect, style, 0, ex_style, dpi) != 0
-        });
+        let adjusted = self
+            .adjust_for_dpi
+            .is_some_and(|adjust| adjust(&mut rect, style, 0, ex_style, dpi) != 0);
         if !adjusted {
             // Do not reuse a partially modified RECT after an unsuccessful call.
             rect = client;

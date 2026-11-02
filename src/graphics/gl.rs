@@ -1531,7 +1531,7 @@ impl RenderingBackend for GlContext {
                 let vb = vertex_buffers[attribute.buffer_index];
                 let vb = self.buffers[vb.0];
 
-                if cached_attr.map_or(true, |cached_attr| {
+                if cached_attr.is_none_or(|cached_attr| {
                     attribute != cached_attr.attribute || cached_attr.gl_vbuf != vb.gl_buf
                 }) {
                     self.cache
@@ -1592,7 +1592,7 @@ impl RenderingBackend for GlContext {
             offset.checked_add(uniform.uniform_type.size().checked_mul(count)?)
         });
         assert!(
-            required_size.map_or(false, |required_size| required_size <= size),
+            required_size.is_some_and(|required_size| required_size <= size),
             "Uniforms struct does not match shader uniforms layout"
         );
 

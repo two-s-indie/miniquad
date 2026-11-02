@@ -58,7 +58,7 @@ const IACE_DEFAULT: DWORD = 0x0010;
 
 // CANDIDATEFORM structure
 #[repr(C)]
-#[allow(non_snake_case)]
+#[allow(non_snake_case,clippy::upper_case_acronyms)]
 struct CANDIDATEFORM {
     dwIndex: DWORD,
     dwStyle: DWORD,
@@ -675,9 +675,8 @@ unsafe fn window_message(
                             let char_count = actual_len as usize / 2;
                             let mods = key_mods();
                             // Send chars in order
-                            for i in 0..char_count {
-                                let chr = buffer[i];
-                                if let Some(c) = char::from_u32(chr as u32) {
+                            for chr in buffer.iter().take(char_count) {
+                                if let Some(c) = char::from_u32(*chr as u32) {
                                     (*payload).events.char_event(c, mods, false);
                                 }
                             }
