@@ -6,6 +6,8 @@ Completed changes in the [two-s-indie Miniquad fork](https://github.com/two-s-in
 
 ### Added
 
+- Added an opt-in Linux X11 fullscreen regression test against a real EWMH window manager, covering GLX/EGL, both startup modes, the first transition, and repeated requests for the same mode.
+
 - Added this fork changelog and repository instructions in `AGENTS.md` requiring changelog updates with commits and recurring checks for undocumented changes.
 - Added a DPI diagnostic example with geometry/input logging, a centered hit-test rectangle, runtime resize controls, and high-DPI, low-DPI, odd-size, and blocking-loop modes. Added a validation guide with the recorded 175% startup baseline and instructions for testing the paired Macroquad example against this checkout.
 - Added Windows DPI fallback and rounding tests, real-window startup checks in isolated processes, and a PerMonitorV2 manifest fixture covering both high-DPI and low-DPI rendering.
@@ -14,6 +16,8 @@ Completed changes in the [two-s-indie Miniquad fork](https://github.com/two-s-in
 - Documented the paired Macroquad coordinate contract and integration results, including native moves between 100% and 175% displays, GPU text/hit-test readback, fractional runtime sizing, cursor clipping, and IMM anchor queries in high/low-DPI normal/blocking modes.
 
 ### Fixed
+
+- **X11 fullscreen:** Set the initial fullscreen hint before mapping the window, and request runtime changes with EWMH ADD/REMOVE messages. Avoid unmapping the window and overwriting its state, which could lose the first fullscreen request on Ubuntu and desynchronize the application from the window manager.
 
 - **Windows FFI declarations:** Use 32-bit Win32 `BOOL` returns for core WGL context operations and the pixel-format and swap-interval extensions, with zero/nonzero success checks. Mark dynamically loaded WGL functions unsafe, reuse available `winapi` IMM declarations, and match the remaining IMM signatures to the Windows SDK.
 - **OpenGL ABI:** Call native OpenGL functions using the system calling convention (stdcall on 32-bit Windows), and use pointer-sized buffer lengths and offsets on 64-bit Windows. Corrected the window-userdata argument type that blocked 32-bit Windows builds. Added signature, return-width, IMM layout, and mock buffer-dispatch regression checks.
@@ -28,6 +32,8 @@ Completed changes in the [two-s-indie Miniquad fork](https://github.com/two-s-in
 - **Windows event loops:** Wake blocking loops for ordinary native resizes, retain the modal redraw timer through nested move/menu loops, ignore stale timer messages after exit, and handle `GetMessage` errors and quit results without dispatching an invalid message.
 
 ### Changed
+
+- Simplified equivalent option checks and Windows character iteration without changing behavior (`31f6108`; backfilled changelog entry).
 
 - Updated the `glam` development dependency from 0.24 to 0.34.2 and migrated the instancing, offscreen, MSAA render texture, and post-processing examples to its camera API, preserving right-handed views and OpenGL projection depth.
 - Raised the minimum Rust version and its CI check from 1.70 to 1.87 to support the updated development dependencies, including `fontdue` 0.9.5's integer casts.

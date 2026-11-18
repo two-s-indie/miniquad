@@ -248,6 +248,28 @@ impl LibX11 {
         // otherwise X11 will skip ChangeProperty(WM_ICON)
         self.update_window_title(display, window, &conf.window_title);
 
+        // Set initial state before the first map, so both GLX and EGL startup
+        // let the window manager apply fullscreen without an unmap/remap race.
+        if conf.fullscreen {
+            let wm_state =
+                (self.XInternAtom)(display, b"_NET_WM_STATE\0".as_ptr() as _, false as _);
+            let wm_fullscreen = (self.XInternAtom)(
+                display,
+                b"_NET_WM_STATE_FULLSCREEN\0".as_ptr() as _,
+                false as _,
+            );
+            (self.XChangeProperty)(
+                display,
+                window,
+                wm_state,
+                4, // XA_ATOM
+                32,
+                PropModeReplace,
+                &wm_fullscreen as *const Atom as *const u8,
+                1,
+            );
+        }
+
         window
     }
 

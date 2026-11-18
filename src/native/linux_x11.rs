@@ -262,77 +262,38 @@ impl X11Display {
         }
     }
 
-    // TODO: right now it just exits early if fullscreen is false.
-    // should be able to able to go back from fullscreen to windowed instead
     unsafe fn set_fullscreen(&mut self, window: Window, fullscreen: bool) {
-        let wm_state = (self.libx11.XInternAtom)(
-            self.display,
-            b"_NET_WM_STATE\x00" as *const u8 as *const _,
-            false as _,
-        );
+        let wm_state =
+            (self.libx11.XInternAtom)(self.display, b"_NET_WM_STATE\0".as_ptr() as _, false as _);
         let wm_fullscreen = (self.libx11.XInternAtom)(
             self.display,
-            if fullscreen {
-                b"_NET_WM_STATE_FULLSCREEN\x00" as *const u8 as *const _
-            } else {
-                b"\x00" as *const u8 as *const _
-            },
+            b"_NET_WM_STATE_FULLSCREEN\0".as_ptr() as _,
             false as _,
         );
 
-        // this is the first method to make window fullscreen
-        // hide it, change _NET_WM_STATE_FULLSCREEN property and than show it back
-        // someone on stackoverflow mentioned that this is not working on ubuntu/unity though
-        {
-            (self.libx11.XLowerWindow)(self.display, window);
-            (self.libx11.XUnmapWindow)(self.display, window);
-            (self.libx11.XSync)(self.display, false as _);
-
-            let mut atoms: [Atom; 2] = [wm_fullscreen, 0 as _];
-            (self.libx11.XChangeProperty)(
-                self.display,
-                window,
-                wm_state,
-                4 as _,
-                32,
-                PropModeReplace,
-                atoms.as_mut_ptr() as *mut _ as *mut _,
-                1,
-            );
-            (self.libx11.XMapWindow)(self.display, window);
-            (self.libx11.XRaiseWindow)(self.display, window);
-            (self.libx11.XFlush)(self.display);
-        }
-
-        // however, this is X, so just in case - the second method
-        // send ClientMessage to the window with request to change property to fullscreen
-        {
-            let mut data = [0isize; 5];
-
-            data[0] = 1;
-            data[1] = wm_fullscreen as isize;
-            data[2] = 0;
-
-            let mut ev = XClientMessageEvent {
-                type_0: 33,
-                serial: 0,
-                send_event: true as _,
-                message_type: wm_state,
-                window,
-                display: self.display,
-                format: 32,
-                data: ClientMessageData {
-                    l: std::mem::transmute(data),
-                },
-            };
-            (self.libx11.XSendEvent)(
-                self.display as _,
-                self.root,
-                false as _,
-                (1048576 | 131072) as _,
-                &mut ev as *mut XClientMessageEvent as *mut _,
-            );
-        }
+        // A mapped window's state belongs to the window manager. Unmapping and
+        // replacing the property races its cleanup and can lose this request.
+        // EWMH: REMOVE = 0, ADD = 1; source indication 1 means application.
+        let mut event = XClientMessageEvent {
+            type_0: ClientMessage,
+            serial: 0,
+            send_event: true as _,
+            display: self.display,
+            window,
+            message_type: wm_state,
+            format: 32,
+            data: ClientMessageData {
+                l: [fullscreen as _, wm_fullscreen as _, 0, 1, 0],
+            },
+        };
+        (self.libx11.XSendEvent)(
+            self.display,
+            self.root,
+            false as _,
+            (SubstructureRedirectMask | SubstructureNotifyMask) as _,
+            &mut event as *mut XClientMessageEvent as *mut _,
+        );
+        (self.libx11.XFlush)(self.display);
     }
 
     unsafe fn set_window_size(&mut self, window: Window, new_width: i32, new_height: i32) {
@@ -493,9 +454,6 @@ where
         blocking_event_loop: conf.platform.blocking_event_loop,
         ..NativeDisplayData::new(w, h, tx, clipboard)
     });
-    if conf.fullscreen {
-        display.set_fullscreen(display.window, true);
-    }
 
     let mut event_handler = (f.take().unwrap())();
 
@@ -603,9 +561,6 @@ where
         blocking_event_loop: conf.platform.blocking_event_loop,
         ..NativeDisplayData::new(w, h, tx, clipboard)
     });
-    if conf.fullscreen {
-        display.set_fullscreen(display.window, true)
-    }
 
     (display.libx11.XFlush)(display.display);
 
