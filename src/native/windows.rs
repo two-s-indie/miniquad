@@ -58,7 +58,7 @@ const IACE_DEFAULT: DWORD = 0x0010;
 
 // CANDIDATEFORM structure
 #[repr(C)]
-#[allow(non_snake_case,clippy::upper_case_acronyms)]
+#[allow(non_snake_case, clippy::upper_case_acronyms)]
 struct CANDIDATEFORM {
     dwIndex: DWORD,
     dwStyle: DWORD,
@@ -96,6 +96,7 @@ extern "system" {
 const IACE_CHILDREN: DWORD = 0x0001;
 
 mod clipboard;
+mod cursor;
 mod dpi;
 mod events;
 mod geometry;
@@ -135,6 +136,7 @@ pub(crate) struct WindowsDisplay {
     mouse_y: f32,
     ime_position: Option<POINT>,
     cursor: HCURSOR,
+    custom_cursor: Option<cursor::NativeCursor>,
     libopengl32: LibOpengl32,
     _msg_wnd: HWND,
     msg_dc: HDC,
@@ -234,6 +236,8 @@ impl WindowsDisplay {
         };
         (*this).cursor = unsafe { LoadCursorW(NULL as _, cursor_name) };
         unsafe { SetCursor((*this).cursor) };
+
+        (*this).custom_cursor = None;
 
         (*this).user_cursor = cursor_icon != CursorIcon::Default;
     }
@@ -1201,6 +1205,7 @@ where
             show_cursor: true,
             user_cursor: false,
             cursor: std::ptr::null_mut(),
+            custom_cursor: None,
             libopengl32,
             _msg_wnd: msg_wnd,
             msg_dc,

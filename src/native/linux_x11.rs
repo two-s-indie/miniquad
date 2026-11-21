@@ -1,6 +1,7 @@
 // Spiritual successor of an X11 part of https://github.com/floooh/sokol/blob/master/sokol_app.h
 
 mod clipboard;
+mod custom_cursor;
 mod drag_n_drop;
 mod glx;
 mod keycodes;
@@ -51,6 +52,7 @@ pub struct X11Display {
     cursor_cache: HashMap<CursorIcon, libx11::Cursor>,
     cursor_icon: CursorIcon,
     cursor_visible: bool,
+    custom_cursor: Option<custom_cursor::NativeCursor>,
     update_requested: bool,
     drag_n_drop: drag_n_drop::X11DnD,
 }
@@ -343,6 +345,7 @@ impl X11Display {
 
         let cursor = match cursor {
             None => self.empty_cursor,
+            Some(_) if self.custom_cursor.is_some() => self.custom_cursor.as_ref().unwrap().handle,
             Some(cursor_icon) => *self.cursor_cache.entry(cursor_icon).or_insert_with(|| {
                 (libx11.XCreateFontCursor)(
                     display,
@@ -379,9 +382,11 @@ impl X11Display {
                     self.set_cursor(self.window, self.cursor_visible.then_some(self.cursor_icon));
                 }
                 SetMouseCursor(icon) => {
+                    self.release_custom_cursor();
                     self.cursor_icon = icon;
                     self.set_cursor(self.window, self.cursor_visible.then_some(self.cursor_icon));
                 }
+                SetCustomMouseCursor(image) => self.set_custom_mouse_cursor(image),
                 SetWindowSize {
                     new_width,
                     new_height,
@@ -492,6 +497,7 @@ where
     glx.destroy_context(display.display, glx_window, glx_context);
     (display.libx11.XUnmapWindow)(display.display, display.window);
     (display.libx11.XDestroyWindow)(display.display, display.window);
+    display.release_custom_cursor();
     (display.libx11.XCloseDisplay)(display.display);
 
     Ok(())
@@ -595,6 +601,7 @@ where
 
     (display.libx11.XUnmapWindow)(display.display, display.window);
     (display.libx11.XDestroyWindow)(display.display, display.window);
+    display.release_custom_cursor();
     (display.libx11.XCloseDisplay)(display.display);
 
     Ok(())
@@ -649,6 +656,7 @@ where
             drag_n_drop: Default::default(),
             cursor_icon: CursorIcon::Default,
             cursor_visible: true,
+            custom_cursor: None,
         };
 
         display

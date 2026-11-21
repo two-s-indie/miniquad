@@ -72,11 +72,22 @@ pub(crate) enum Request {
     SetCursorGrab(bool),
     ShowMouse(bool),
     SetMouseCursor(crate::CursorIcon),
-    SetWindowSize { new_width: u32, new_height: u32 },
-    SetWindowPosition { new_x: u32, new_y: u32 },
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    SetCustomMouseCursor(crate::CustomCursor),
+    SetWindowSize {
+        new_width: u32,
+        new_height: u32,
+    },
+    SetWindowPosition {
+        new_x: u32,
+        new_y: u32,
+    },
     SetFullscreen(bool),
     ShowKeyboard(bool),
-    SetImePosition { x: i32, y: i32 },
+    SetImePosition {
+        x: i32,
+        y: i32,
+    },
     SetImeEnabled(bool),
 }
 

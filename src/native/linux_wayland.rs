@@ -5,6 +5,7 @@ mod libwayland_egl;
 mod libxkbcommon;
 
 mod clipboard;
+mod custom_cursor;
 mod decorations;
 mod drag_n_drop;
 mod extensions;
@@ -318,6 +319,7 @@ struct PointerContext {
     /// Wayland does not remember what cursor icon a window has; if the cursor leaves and comes
     /// back, it will not be reset to what icon it had unless we keep track of it.
     cursor_icon: Option<crate::CursorIcon>,
+    custom_cursor: Option<custom_cursor::NativeCursor>,
     /// Wayland requires that only the window with focus can set the cursor. So if we don't have
     /// the focus yet, we queue the cursor icon and apply it once we regain focus.
     queued_cursor_icon: Option<Option<crate::CursorIcon>>,
@@ -335,6 +337,7 @@ impl PointerContext {
             enter_serial: None,
             position: (0., 0.),
             cursor_icon: Some(crate::CursorIcon::Default),
+            custom_cursor: None,
             queued_cursor_icon: None,
             cursor_shape_manager: std::ptr::null_mut(),
             cursor_shape_device: std::ptr::null_mut(),
@@ -352,7 +355,9 @@ impl PointerContext {
     ) {
         self.cursor_icon = icon;
         if let Some(icon) = icon {
-            if !self.cursor_shape_device.is_null() {
+            if let Some(cursor) = &self.custom_cursor {
+                cursor.apply(client, self.pointer, serial);
+            } else if !self.cursor_shape_device.is_null() {
                 wl_request!(
                     client,
                     self.cursor_shape_device,
@@ -1232,9 +1237,38 @@ where
                     Request::ScheduleUpdate => display.update_requested = true,
                     Request::SetMouseCursor(icon) => {
                         cursor_icon = icon;
+                        let old_cursor = display.pointer_context.custom_cursor.take();
                         display
                             .pointer_context
                             .set_cursor(&mut display.client, cursor_visible.then_some(cursor_icon));
+                        if let Some(cursor) = old_cursor {
+                            cursor.destroy(&mut display.client);
+                        }
+                    }
+                    Request::SetCustomMouseCursor(image) => {
+                        if !display
+                            .pointer_context
+                            .custom_cursor
+                            .as_ref()
+                            .is_some_and(|cursor| cursor.image.same_image(&image))
+                        {
+                            match custom_cursor::NativeCursor::new(&mut display, image) {
+                                Ok(cursor) => {
+                                    let old_cursor =
+                                        display.pointer_context.custom_cursor.replace(cursor);
+                                    display.pointer_context.set_cursor(
+                                        &mut display.client,
+                                        cursor_visible.then_some(cursor_icon),
+                                    );
+                                    if let Some(cursor) = old_cursor {
+                                        cursor.destroy(&mut display.client);
+                                    }
+                                }
+                                Err(error) => {
+                                    eprintln!("Could not create native mouse cursor: {error}")
+                                }
+                            }
+                        }
                     }
                     Request::SetCursorGrab(grab) => {
                         let payload = &mut display as *mut _ as _;
@@ -1325,6 +1359,9 @@ where
                 event_handler.draw();
                 (libegl.eglSwapBuffers)(egl_display, egl_surface);
             }
+        }
+        if let Some(cursor) = display.pointer_context.custom_cursor.take() {
+            cursor.destroy(&mut display.client);
         }
     }
 

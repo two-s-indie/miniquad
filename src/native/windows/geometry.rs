@@ -412,6 +412,7 @@ impl WindowsDisplay {
             SetCursorGrab(grab) => Self::set_cursor_grab(this, grab),
             ShowMouse(show) => Self::show_mouse(this, show),
             SetMouseCursor(icon) => Self::set_mouse_cursor(this, icon),
+            SetCustomMouseCursor(image) => Self::set_custom_mouse_cursor(this, image),
             ShowKeyboard(show) => {
                 IME_USER_DISABLED.store(!show, std::sync::atomic::Ordering::Relaxed)
             }

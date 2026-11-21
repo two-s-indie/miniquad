@@ -8,6 +8,8 @@
 )]
 
 pub mod conf;
+mod cursor;
+pub use cursor::{CursorError, CustomCursor};
 mod event;
 pub mod fs;
 pub mod graphics;
@@ -267,7 +269,7 @@ pub mod window {
         }
     }
 
-    /// Set the mouse cursor icon.
+    /// Set the mouse cursor icon, replacing any custom image.
     pub fn set_mouse_cursor(cursor_icon: CursorIcon) {
         let d = native_display().lock().unwrap();
         #[cfg(target_os = "android")]
@@ -280,6 +282,32 @@ pub mod window {
             d.native_requests
                 .send(native::Request::SetMouseCursor(cursor_icon))
                 .unwrap();
+        }
+    }
+
+    /// Queue a native cursor image for this window's client area.
+    ///
+    /// Supported on Windows and Linux (X11 requires libXcursor; Wayland requires
+    /// shared memory and the cursor-shape protocol). The image stays
+    /// active until replaced by this function or `set_mouse_cursor`; visibility
+    /// is still controlled by `show_mouse`. No per-frame drawing is required.
+    /// Reapplying the same image is inexpensive. Native allocation failures are
+    /// logged by the event loop and leave the previous cursor intact.
+    pub fn set_custom_mouse_cursor(cursor: &CustomCursor) -> Result<(), CursorError> {
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
+        {
+            native_display()
+                .lock()
+                .unwrap()
+                .native_requests
+                .send(native::Request::SetCustomMouseCursor(cursor.clone()))
+                .unwrap();
+            Ok(())
+        }
+        #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+        {
+            let _ = cursor;
+            Err(CursorError::UnsupportedPlatform)
         }
     }
 

@@ -6,6 +6,8 @@ Completed changes in the [two-s-indie Miniquad fork](https://github.com/two-s-in
 
 ### Added
 
+- Added validated RGBA native mouse cursors with image-pixel hotspots and runtime switching on Windows and Linux (X11 and Wayland). Standard cursor selection restores the system pointer; visibility changes retain the custom image. Windows restricts the image to the client area and frees private cursor handles on replacement/shutdown. X11 uses libXcursor; Wayland requires the cursor-shape protocol so the system pointer can be restored. Native creation failures preserve the previous cursor; Wayland cursor allocation uses a fallible shared-memory helper.
+- Added image validation, alpha conversion, real Windows cursor/hotspot tests, and a native-window regression for runtime switching, repeated selection, source lifetime, visibility, default restoration, and resize-border cursors. All 20 Windows library tests and the native-window regression passed; Linux was compile-checked.
 - Added an opt-in Linux X11 fullscreen regression test against a real EWMH window manager, covering GLX/EGL, both startup modes, the first transition, and repeated requests for the same mode.
 
 - Added this fork changelog and repository instructions in `AGENTS.md` requiring changelog updates with commits and recurring checks for undocumented changes.

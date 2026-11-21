@@ -912,6 +912,7 @@ crate::declare_module!(
     pub fn XUnmapWindow(*mut Display, Window) -> c_int,
     pub fn XDestroyWindow(*mut Display, Window) -> c_int,
     pub fn XFreeColormap(*mut Display, Colormap) -> c_int,
+    pub fn XFreeCursor(*mut Display, Cursor) -> c_int,
     pub fn XFlush(*mut Display) -> c_int,
     pub fn XCloseDisplay(*mut Display) -> c_int,
     pub fn XGrabPointer(*mut Display, Window, c_int, c_uint, c_int, c_int, Window, Cursor, Time) -> c_int,
